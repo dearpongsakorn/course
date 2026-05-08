@@ -8,4 +8,7 @@ export interface User {
   avatarUrl?: string
   status: 'active' | 'pending' | 'suspended'
   createdAt: string
+  isOnline?: boolean
+  activeSessions?: number
+  lastSeenAt?: string | null
 }

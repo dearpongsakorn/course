@@ -1,18 +1,22 @@
 import { useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   AlertTriangle,
+  Camera,
   Edit3,
+  Eye,
+  EyeOff,
   ImagePlus,
   LoaderCircle,
   Plus,
   Trash2,
-  UploadCloud,
+  UserRound,
   Video,
   X,
 } from 'lucide-react'
 import { useApi } from '../hooks/useApi'
-import { api } from '../services/api'
-import type { Course } from '../types/course'
+import { api, authStorage, type StudentProfile } from '../services/api'
+import type { Course, Lesson } from '../types/course'
 
 const defaultCover =
   'https://images.unsplash.com/photo-1516321497487-e288fb19713f?auto=format&fit=crop&w=1200&q=80'
@@ -26,24 +30,44 @@ const createEmptyDraft = () => ({
   duration: '',
   outcomes: '',
   coverImageUrl: '',
-  lessonTitle: '',
-  lessonSummary: '',
-  lessonDuration: '',
-  lessonPreview: true,
-  videoUrl: '',
 })
 
 type CourseDraft = ReturnType<typeof createEmptyDraft>
 type FormMode = 'create' | 'edit'
+type LessonDraft = {
+  title: string
+  duration: string
+  summary: string
+  preview: boolean
+  videoUrl: string
+}
+type TeacherProfileDraft = Pick<StudentProfile, 'name' | 'headline' | 'bio' | 'phone' | 'avatarUrl'>
 
-const formatBytes = (value: number) => {
-  if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`
-  return `${(value / (1024 * 1024)).toFixed(1)} MB`
+const emptyLessonDraft: LessonDraft = {
+  title: '',
+  duration: '',
+  summary: '',
+  preview: true,
+  videoUrl: '',
+}
+
+const draftFromLesson = (lesson: Lesson): LessonDraft => ({
+  title: lesson.title,
+  duration: lesson.duration,
+  summary: lesson.summary,
+  preview: lesson.preview,
+  videoUrl: lesson.videoUrl ?? '',
+})
+
+const emptyTeacherProfile: TeacherProfileDraft = {
+  name: '',
+  headline: '',
+  bio: '',
+  phone: '',
+  avatarUrl: '',
 }
 
 const draftFromCourse = (course: Course): CourseDraft => {
-  const firstLesson = course.lessons[0]
-
   return {
     title: course.title,
     description: course.description,
@@ -53,53 +77,53 @@ const draftFromCourse = (course: Course): CourseDraft => {
     duration: course.duration,
     outcomes: course.outcomes.join('\n'),
     coverImageUrl: course.coverImage.startsWith('/uploads/') ? '' : course.coverImage,
-    lessonTitle: firstLesson?.title ?? '',
-    lessonSummary: firstLesson?.summary ?? '',
-    lessonDuration: firstLesson?.duration ?? '',
-    lessonPreview: firstLesson?.preview ?? true,
-    videoUrl: firstLesson?.videoUrl ?? '',
   }
 }
+
+const courseStatusMeta = {
+  draft: {
+    label: 'ฉบับร่าง',
+    badgeClass: 'border-amber-200 bg-amber-50 text-amber-700',
+    actionLabel: 'เผยแพร่',
+  },
+  published: {
+    label: 'เผยแพร่แล้ว',
+    badgeClass: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+    actionLabel: 'ซ่อน',
+  },
+  hidden: {
+    label: 'ซ่อนอยู่',
+    badgeClass: 'border-slate-200 bg-slate-50 text-slate-600',
+    actionLabel: 'เผยแพร่',
+  },
+} satisfies Record<Course['status'], { label: string; badgeClass: string; actionLabel: string }>
+
+const getCourseStatusMeta = (status: Course['status'] | undefined) =>
+  courseStatusMeta[status ?? 'published'] ?? courseStatusMeta.published
 
 function CourseFormModal({
   mode,
   draft,
   coverPreview,
-  videoPreview,
   coverFile,
-  videoFile,
-  uploadingVideo,
   formMessage,
   saving,
   onClose,
   onSubmit,
   onDraftChange,
   onCoverChange,
-  onVideoChange,
 }: {
   mode: FormMode
   draft: CourseDraft
   coverPreview: string
-  videoPreview: string
   coverFile: File | null
-  videoFile: File | null
-  uploadingVideo: boolean
   formMessage: { tone: 'success' | 'error'; text: string } | null
   saving: boolean
   onClose: () => void
   onSubmit: (event: React.FormEvent<HTMLFormElement>) => void
   onDraftChange: <K extends keyof CourseDraft>(key: K, value: CourseDraft[K]) => void
   onCoverChange: (event: React.ChangeEvent<HTMLInputElement>) => void
-  onVideoChange: (event: React.ChangeEvent<HTMLInputElement>) => void
 }) {
-  const [videoPreviewError, setVideoPreviewError] = useState(false)
-
-  useEffect(() => {
-    queueMicrotask(() => {
-      setVideoPreviewError(false)
-    })
-  }, [videoPreview])
-
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-950/55 px-4 py-8">
       <div className="w-full max-w-5xl rounded-lg border border-slate-200 bg-white shadow-2xl">
@@ -110,8 +134,8 @@ function CourseFormModal({
             </h2>
             <p className="mt-1 text-sm text-slate-500">
               {mode === 'create'
-                ? 'สร้างคอร์สพร้อมบทเรียนแรกใน popup เดียว'
-                : 'ปรับข้อมูล รูปปก และวิดีโอของคอร์สนี้ได้จาก popup เดียว'}
+                ? 'สร้างข้อมูลคอร์สก่อน แล้วเพิ่มบทเรียนจากปุ่มบทเรียนในตาราง'
+                : 'ปรับข้อมูลคอร์สและรูปปกได้จาก popup นี้'}
             </p>
           </div>
           <button type="button" className="btn-ghost" onClick={onClose} aria-label="ปิด popup">
@@ -213,7 +237,7 @@ function CourseFormModal({
               />
             </label>
 
-            <div className="sm:col-span-2 grid gap-4 lg:grid-cols-2">
+            <div className="sm:col-span-2 grid gap-4">
               <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
                 <div className="flex items-center gap-2 text-sm font-medium text-slate-950">
                   <ImagePlus size={16} />
@@ -247,139 +271,21 @@ function CourseFormModal({
                 </div>
               </div>
 
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
-                <div className="flex items-center gap-2 text-sm font-medium text-slate-950">
-                  <Video size={16} />
-                  วิดีโอบทเรียนแรก
-                </div>
-                <div className="mt-4 flex min-h-52 flex-col justify-between rounded-md border border-dashed border-slate-300 bg-white p-4">
-                  <div className="flex items-start gap-3">
-                    <span className="inline-flex h-10 w-10 items-center justify-center rounded-md bg-slate-950 text-white">
-                      <UploadCloud size={18} />
-                    </span>
-                    <div>
-                      <p className="font-medium text-slate-950">อัปโหลดไฟล์ MP4</p>
-                      <p className="mt-1 text-sm leading-6 text-slate-500">
-                        รองรับไฟล์วิดีโอสำหรับบทเรียนแรก สูงสุด 500MB และระบบจะแปลงเป็น MP4 แบบที่เว็บเล่นได้ให้อัตโนมัติ
-                      </p>
-                    </div>
-                  </div>
 
-                  <div className="mt-4 space-y-3">
-                    <input
-                      type="file"
-                      accept="video/mp4,.mp4"
-                      className="field-input file:mr-3 file:rounded-md file:border-0 file:bg-slate-950 file:px-3 file:py-2 file:text-sm file:font-medium file:text-white"
-                      onChange={onVideoChange}
-                    />
-                    <div className="rounded-md bg-slate-50 px-3 py-2 text-sm text-slate-600">
-                      {uploadingVideo
-                        ? 'กำลังอัปโหลดและแปลงวิดีโอสำหรับ preview...'
-                        : videoFile
-                        ? `${videoFile.name} • ${formatBytes(videoFile.size)}`
-                        : draft.videoUrl
-                          ? 'ใช้วิดีโอเดิมของคอร์สนี้'
-                          : 'ยังไม่ได้เลือกไฟล์วิดีโอ'}
-                    </div>
-                    <div className="overflow-hidden rounded-md border border-slate-200 bg-slate-950">
-                      {videoPreview ? (
-                        videoPreviewError ? (
-                          <div className="aspect-video bg-slate-950">
-                            <img
-                              src={coverPreview}
-                              alt="Video preview fallback"
-                              className="h-full w-full object-cover opacity-80"
-                            />
-                          </div>
-                        ) : (
-                          <video
-                            className="aspect-video w-full bg-slate-950 object-contain"
-                            controls
-                            playsInline
-                            preload="metadata"
-                            poster={coverPreview}
-                            src={videoPreview}
-                            onLoadedData={() => setVideoPreviewError(false)}
-                            onError={() => setVideoPreviewError(true)}
-                          />
-                        )
-                      ) : (
-                        <div className="flex aspect-video items-center justify-center text-sm text-slate-300">
-                          ยังไม่มีพรีวิววิดีโอ
-                        </div>
-                      )}
-                    </div>
-                    {videoPreviewError ? (
-                      <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-                        เบราว์เซอร์พรีวิวไฟล์ต้นฉบับนี้ไม่ได้ แต่หลังบันทึกระบบจะแปลงวิดีโอให้และหน้าเรียนจะเล่นได้ตามปกติ
-                      </div>
-                    ) : null}
-                  </div>
-                </div>
-              </div>
             </div>
 
-            <div className="sm:col-span-2 grid gap-4 rounded-lg border border-slate-200 bg-white p-4">
-              <div>
-                <h3 className="text-sm font-semibold text-slate-950">ตั้งค่าบทเรียนแรก</h3>
-                <p className="mt-1 text-sm text-slate-500">ใช้ทั้งตอนสร้างคอร์สใหม่และตอนแก้ไขคอร์สเดิม</p>
-              </div>
 
-              <div className="grid gap-4 sm:grid-cols-2">
-                <label className="block">
-                  <span className="field-label">ชื่อบทเรียน</span>
-                  <input
-                    className="field-input"
-                    placeholder="บทเรียนที่ 1: เริ่มต้นคอร์ส"
-                    value={draft.lessonTitle}
-                    onChange={(event) => onDraftChange('lessonTitle', event.target.value)}
-                  />
-                </label>
-                <label className="block">
-                  <span className="field-label">ความยาววิดีโอ</span>
-                  <input
-                    className="field-input"
-                    placeholder="12:30"
-                    value={draft.lessonDuration}
-                    onChange={(event) => onDraftChange('lessonDuration', event.target.value)}
-                  />
-                </label>
-                <label className="block sm:col-span-2">
-                  <span className="field-label">สรุปบทเรียน</span>
-                  <textarea
-                    className="field-input min-h-24 resize-y"
-                    placeholder="เขียนสรุปสั้น ๆ ของบทเรียนแรก เพื่อใช้แสดงในหน้าเรียน"
-                    value={draft.lessonSummary}
-                    onChange={(event) => onDraftChange('lessonSummary', event.target.value)}
-                  />
-                </label>
-                <label className="flex items-center gap-3 rounded-md border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 sm:col-span-2">
-                  <input
-                    type="checkbox"
-                    checked={draft.lessonPreview}
-                    onChange={(event) => onDraftChange('lessonPreview', event.target.checked)}
-                    className="h-4 w-4 rounded border-slate-300"
-                  />
-                  เปิดให้บทเรียนแรกเป็นตัวอย่างก่อนซื้อ
-                </label>
-              </div>
-            </div>
           </div>
 
           <div className="mt-6 flex items-center justify-end gap-3 border-t border-slate-200 pt-5">
             <button type="button" className="btn-secondary" onClick={onClose}>
               ยกเลิก
             </button>
-            <button type="submit" className="btn-primary" disabled={saving || uploadingVideo}>
+            <button type="submit" className="btn-primary" disabled={saving}>
               {saving ? (
                 <>
                   <LoaderCircle size={16} className="animate-spin" />
                   กำลังบันทึก...
-                </>
-              ) : uploadingVideo ? (
-                <>
-                  <LoaderCircle size={16} className="animate-spin" />
-                  กำลังเตรียมวิดีโอ...
                 </>
               ) : mode === 'create' ? (
                 <>
@@ -439,20 +345,219 @@ function DeleteModal({
   )
 }
 
+function LessonManagerModal({
+  course,
+  draft,
+  editingLessonId,
+  saving,
+  uploading,
+  message,
+  onClose,
+  onNew,
+  onSelect,
+  onDraftChange,
+  onVideoChange,
+  onSubmit,
+  onDelete,
+}: {
+  course: Course
+  draft: LessonDraft
+  editingLessonId: string | null
+  saving: boolean
+  uploading: boolean
+  message: { tone: 'success' | 'error'; text: string } | null
+  onClose: () => void
+  onNew: () => void
+  onSelect: (lesson: Lesson) => void
+  onDraftChange: <K extends keyof LessonDraft>(key: K, value: LessonDraft[K]) => void
+  onVideoChange: (event: React.ChangeEvent<HTMLInputElement>) => void
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => void
+  onDelete: (lessonId: string) => void
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-950/55 px-4 py-8">
+      <div className="w-full max-w-6xl rounded-lg border border-slate-200 bg-white shadow-2xl">
+        <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4 sm:px-6">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-950">จัดการบทเรียน</h2>
+            <p className="mt-1 text-sm text-slate-500">{course.title}</p>
+          </div>
+          <button type="button" className="btn-ghost" onClick={onClose} aria-label="ปิด popup">
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="grid gap-0 lg:grid-cols-[320px_minmax(0,1fr)]">
+          <aside className="border-b border-slate-200 bg-slate-50 p-5 lg:border-b-0 lg:border-r">
+            <button type="button" className="btn-primary w-full" onClick={onNew}>
+              <Plus size={16} />
+              เพิ่มบทเรียน
+            </button>
+            <div className="mt-4 space-y-2">
+              {course.lessons.length ? (
+                course.lessons.map((lesson, index) => (
+                  <button
+                    key={lesson.id}
+                    type="button"
+                    className={[
+                      'w-full rounded-md border px-3 py-3 text-left transition',
+                      editingLessonId === lesson.id
+                        ? 'border-slate-950 bg-white text-slate-950 shadow-sm'
+                        : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300',
+                    ].join(' ')}
+                    onClick={() => onSelect(lesson)}
+                  >
+                    <p className="text-sm font-semibold">
+                      {index + 1}. {lesson.title}
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-2 text-xs text-slate-500">
+                      <span>{lesson.duration || '00:00'}</span>
+                      {lesson.preview ? <span>Preview</span> : null}
+                      {lesson.videoUrl ? <span>มีวิดีโอ</span> : null}
+                    </div>
+                  </button>
+                ))
+              ) : (
+                <p className="rounded-md border border-dashed border-slate-300 bg-white p-4 text-sm text-slate-500">
+                  ยังไม่มีบทเรียน
+                </p>
+              )}
+            </div>
+          </aside>
+
+          <form className="space-y-4 p-5 sm:p-6" onSubmit={onSubmit}>
+            {message ? (
+              <div
+                className={`rounded-lg border px-4 py-3 text-sm ${
+                  message.tone === 'success'
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                    : 'border-rose-200 bg-rose-50 text-rose-700'
+                }`}
+              >
+                {message.text}
+              </div>
+            ) : null}
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <label className="block sm:col-span-2">
+                <span className="field-label">ชื่อบทเรียน</span>
+                <input
+                  className="field-input"
+                  value={draft.title}
+                  onChange={(event) => onDraftChange('title', event.target.value)}
+                  placeholder="บทเรียนที่ 1: เริ่มต้นคอร์ส"
+                  required
+                />
+              </label>
+
+              <label className="block">
+                <span className="field-label">ความยาววิดีโอ</span>
+                <input
+                  className="field-input"
+                  value={draft.duration}
+                  onChange={(event) => onDraftChange('duration', event.target.value)}
+                  placeholder="12:30"
+                />
+              </label>
+
+              <label className="block">
+                <span className="field-label">อัปโหลดวิดีโอ MP4</span>
+                <input
+                  type="file"
+                  accept="video/mp4,.mp4"
+                  className="field-input file:mr-3 file:rounded-md file:border-0 file:bg-slate-950 file:px-3 file:py-2 file:text-sm file:font-medium file:text-white"
+                  onChange={onVideoChange}
+                  disabled={uploading}
+                />
+              </label>
+
+              <label className="block sm:col-span-2">
+                <span className="field-label">สรุปบทเรียน</span>
+                <textarea
+                  className="field-input min-h-28 resize-y"
+                  value={draft.summary}
+                  onChange={(event) => onDraftChange('summary', event.target.value)}
+                  placeholder="เขียนสรุปสั้น ๆ ของบทเรียน"
+                />
+              </label>
+
+              {draft.videoUrl ? (
+                <div className="sm:col-span-2 overflow-hidden rounded-md border border-slate-200 bg-slate-950">
+                  <video className="aspect-video w-full bg-slate-950 object-contain" controls playsInline src={draft.videoUrl} />
+                </div>
+              ) : null}
+
+              <label className="flex items-center gap-3 rounded-md border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 sm:col-span-2">
+                <input
+                  type="checkbox"
+                  checked={draft.preview}
+                  onChange={(event) => onDraftChange('preview', event.target.checked)}
+                  className="h-4 w-4 rounded border-slate-300"
+                />
+                เปิดให้บทเรียนนี้เป็นตัวอย่างก่อนซื้อ
+              </label>
+            </div>
+
+            <div className="flex flex-col gap-3 border-t border-slate-200 pt-5 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                {editingLessonId ? (
+                  <button
+                    type="button"
+                    className="btn-secondary text-rose-700"
+                    onClick={() => onDelete(editingLessonId)}
+                    disabled={saving || uploading}
+                  >
+                    <Trash2 size={16} />
+                    ลบบทเรียน
+                  </button>
+                ) : null}
+              </div>
+              <button type="submit" className="btn-primary" disabled={saving || uploading}>
+                {saving || uploading ? (
+                  <>
+                    <LoaderCircle size={16} className="animate-spin" />
+                    กำลังบันทึก...
+                  </>
+                ) : (
+                  <>
+                    <Video size={16} />
+                    {editingLessonId ? 'บันทึกบทเรียน' : 'เพิ่มบทเรียน'}
+                  </>
+                )}
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function TeacherDashboard() {
+  const [searchParams] = useSearchParams()
+  const activeSection = searchParams.get('section') === 'profile' ? 'profile' : 'courses'
   const { data, error, loading } = useApi(() => api.getTeacherDashboard(), [])
   const [courses, setCourses] = useState<Course[]>([])
+  const [teacherProfile, setTeacherProfile] = useState<StudentProfile | null>(null)
+  const [profileDraft, setProfileDraft] = useState<TeacherProfileDraft>(emptyTeacherProfile)
+  const [profileError, setProfileError] = useState<string | null>(null)
+  const [savingProfile, setSavingProfile] = useState(false)
+  const [uploadingAvatar, setUploadingAvatar] = useState(false)
   const [saving, setSaving] = useState(false)
   const [deletingSlug, setDeletingSlug] = useState<string | null>(null)
+  const [updatingStatusSlug, setUpdatingStatusSlug] = useState<string | null>(null)
   const [message, setMessage] = useState<{ tone: 'success' | 'error'; text: string } | null>(null)
   const [formMode, setFormMode] = useState<FormMode>('create')
   const [formOpen, setFormOpen] = useState(false)
   const [editingSlug, setEditingSlug] = useState<string | null>(null)
+  const [lessonCourse, setLessonCourse] = useState<Course | null>(null)
+  const [editingLessonId, setEditingLessonId] = useState<string | null>(null)
+  const [lessonDraft, setLessonDraft] = useState<LessonDraft>(emptyLessonDraft)
+  const [lessonMessage, setLessonMessage] = useState<{ tone: 'success' | 'error'; text: string } | null>(null)
+  const [savingLesson, setSavingLesson] = useState(false)
+  const [uploadingLessonVideo, setUploadingLessonVideo] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<Course | null>(null)
   const [coverFile, setCoverFile] = useState<File | null>(null)
-  const [videoFile, setVideoFile] = useState<File | null>(null)
-  const [uploadingVideo, setUploadingVideo] = useState(false)
-  const [videoPreview, setVideoPreview] = useState<string>('')
   const [coverPreview, setCoverPreview] = useState<string>(defaultCover)
   const [draft, setDraft] = useState<CourseDraft>(() => createEmptyDraft())
 
@@ -462,17 +567,48 @@ export default function TeacherDashboard() {
     })
   }, [data?.courses])
 
+  const currentTeacherProfile = data
+    ? teacherProfile ??
+      data.profile ?? {
+        name: data.user.name,
+        headline: '',
+        bio: '',
+        learningGoal: '',
+        phone: '',
+        avatarUrl: data.user.avatarUrl ?? '',
+        updatedAt: null,
+      }
+    : null
+
+  useEffect(() => {
+    if (!data || !currentTeacherProfile) return
+
+    setProfileDraft({
+      name: currentTeacherProfile.name || data.user.name,
+      headline: currentTeacherProfile.headline,
+      bio: currentTeacherProfile.bio,
+      phone: currentTeacherProfile.phone,
+      avatarUrl: currentTeacherProfile.avatarUrl || data.user.avatarUrl || '',
+    })
+  }, [
+    currentTeacherProfile?.avatarUrl,
+    currentTeacherProfile?.bio,
+    currentTeacherProfile?.headline,
+    currentTeacherProfile?.name,
+    currentTeacherProfile?.phone,
+    currentTeacherProfile?.updatedAt,
+    data?.user.avatarUrl,
+    data?.user.id,
+    data?.user.name,
+  ])
+
   const editingCourse = useMemo(
     () => courses.find((course) => course.slug === editingSlug) ?? null,
     [courses, editingSlug],
   )
-
   const resetDraft = () => {
     setDraft(createEmptyDraft())
     setCoverFile(null)
-    setVideoFile(null)
-    setUploadingVideo(false)
-    setVideoPreview('')
     setCoverPreview(defaultCover)
     setEditingSlug(null)
   }
@@ -494,11 +630,45 @@ export default function TeacherDashboard() {
     setEditingSlug(course.slug)
     setDraft(draftFromCourse(course))
     setCoverFile(null)
-    setVideoFile(null)
-    setVideoPreview(course.lessons[0]?.videoUrl ?? '')
     setCoverPreview(course.coverImage)
     setFormOpen(true)
     setMessage(null)
+  }
+
+  const openLessonManager = (course: Course) => {
+    setLessonCourse(course)
+    setEditingLessonId(course.lessons[0]?.id ?? null)
+    setLessonDraft(course.lessons[0] ? draftFromLesson(course.lessons[0]) : emptyLessonDraft)
+    setLessonMessage(null)
+  }
+
+  const closeLessonManager = () => {
+    setLessonCourse(null)
+    setEditingLessonId(null)
+    setLessonDraft(emptyLessonDraft)
+    setLessonMessage(null)
+    setUploadingLessonVideo(false)
+  }
+
+  const startNewLesson = () => {
+    setEditingLessonId(null)
+    setLessonDraft(emptyLessonDraft)
+    setLessonMessage(null)
+  }
+
+  const selectLesson = (lesson: Lesson) => {
+    setEditingLessonId(lesson.id)
+    setLessonDraft(draftFromLesson(lesson))
+    setLessonMessage(null)
+  }
+
+  const handleLessonDraftChange = <K extends keyof LessonDraft>(key: K, value: LessonDraft[K]) => {
+    setLessonDraft((current) => ({ ...current, [key]: value }))
+  }
+
+  const replaceCourse = (course: Course) => {
+    setCourses((current) => current.map((item) => (item.id === course.id ? course : item)))
+    setLessonCourse(course)
   }
 
   const handleDraftChange = <K extends keyof CourseDraft>(key: K, value: CourseDraft[K]) => {
@@ -521,33 +691,136 @@ export default function TeacherDashboard() {
     setCoverPreview(URL.createObjectURL(file))
   }
 
-  const handleVideoChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0] ?? null
-    setVideoFile(file)
+  const handleLessonVideoChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
 
-    if (!file) {
-      const fallbackVideoUrl = draft.videoUrl || editingCourse?.lessons[0]?.videoUrl || ''
-      setVideoPreview(fallbackVideoUrl)
-      return
-    }
+    if (!file) return
 
-    setUploadingVideo(true)
-    setVideoPreview('')
-    setMessage(null)
+    setUploadingLessonVideo(true)
+    setLessonMessage(null)
 
     try {
-      const uploadedVideo = await api.uploadAsset({ kind: 'video', file })
-      setDraft((current) => ({ ...current, videoUrl: uploadedVideo.fileUrl }))
-      setVideoPreview(uploadedVideo.fileUrl)
+      const uploaded = await api.uploadAsset({ kind: 'video', file })
+      setLessonDraft((current) => ({ ...current, videoUrl: uploaded.fileUrl }))
     } catch (currentError) {
-      setDraft((current) => ({ ...current, videoUrl: editingCourse?.lessons[0]?.videoUrl ?? '' }))
-      setVideoPreview(editingCourse?.lessons[0]?.videoUrl || '')
-      setMessage({
+      setLessonMessage({
         tone: 'error',
-        text: currentError instanceof Error ? currentError.message : 'ไม่สามารถอัปโหลดวิดีโอสำหรับ preview ได้',
+        text: currentError instanceof Error ? currentError.message : 'อัปโหลดวิดีโอไม่สำเร็จ',
       })
     } finally {
-      setUploadingVideo(false)
+      setUploadingLessonVideo(false)
+    }
+  }
+
+  const saveLesson = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+
+    if (!lessonCourse) return
+
+    setSavingLesson(true)
+    setLessonMessage(null)
+
+    try {
+      const nextCourse = await api.saveLesson(lessonCourse.slug, editingLessonId, {
+        title: lessonDraft.title,
+        duration: lessonDraft.duration || '00:00',
+        summary: lessonDraft.summary,
+        preview: lessonDraft.preview,
+        videoUrl: lessonDraft.videoUrl || undefined,
+      })
+      replaceCourse(nextCourse)
+
+      const nextLesson =
+        editingLessonId
+          ? nextCourse.lessons.find((lesson) => lesson.id === editingLessonId)
+          : nextCourse.lessons[nextCourse.lessons.length - 1]
+
+      setEditingLessonId(nextLesson?.id ?? null)
+      if (nextLesson) setLessonDraft(draftFromLesson(nextLesson))
+      setLessonMessage({ tone: 'success', text: 'บันทึกบทเรียนเรียบร้อยแล้ว' })
+    } catch (currentError) {
+      setLessonMessage({
+        tone: 'error',
+        text: currentError instanceof Error ? currentError.message : 'บันทึกบทเรียนไม่สำเร็จ',
+      })
+    } finally {
+      setSavingLesson(false)
+    }
+  }
+
+  const deleteLesson = async (lessonId: string) => {
+    if (!lessonCourse) return
+
+    setSavingLesson(true)
+    setLessonMessage(null)
+
+    try {
+      const nextCourse = await api.deleteLesson(lessonCourse.slug, lessonId)
+      replaceCourse(nextCourse)
+      const nextLesson = nextCourse.lessons[0]
+      setEditingLessonId(nextLesson?.id ?? null)
+      setLessonDraft(nextLesson ? draftFromLesson(nextLesson) : emptyLessonDraft)
+      setLessonMessage({ tone: 'success', text: 'ลบบทเรียนเรียบร้อยแล้ว' })
+    } catch (currentError) {
+      setLessonMessage({
+        tone: 'error',
+        text: currentError instanceof Error ? currentError.message : 'ลบบทเรียนไม่สำเร็จ',
+      })
+    } finally {
+      setSavingLesson(false)
+    }
+  }
+
+  const handleProfileAvatarChange = async (file: File | undefined) => {
+    if (!file) return
+
+    setUploadingAvatar(true)
+    setProfileError(null)
+
+    try {
+      const uploaded = await api.uploadAsset({ kind: 'avatar', file })
+      setProfileDraft((current) => ({ ...current, avatarUrl: uploaded.fileUrl }))
+    } catch (currentError) {
+      setProfileError(currentError instanceof Error ? currentError.message : 'อัปโหลดรูปโปรไฟล์ไม่สำเร็จ')
+    } finally {
+      setUploadingAvatar(false)
+    }
+  }
+
+  const saveTeacherProfile = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+
+    if (!currentTeacherProfile) return
+
+    setSavingProfile(true)
+    setProfileError(null)
+
+    try {
+      const nextProfile = await api.updateTeacherProfile({
+        name: profileDraft.name,
+        headline: profileDraft.headline,
+        bio: profileDraft.bio,
+        phone: profileDraft.phone,
+        avatarUrl: profileDraft.avatarUrl,
+        learningGoal: currentTeacherProfile.learningGoal,
+      })
+      setTeacherProfile(nextProfile)
+
+      const session = authStorage.getSession()
+      if (session) {
+        authStorage.setSession({
+          ...session,
+          user: {
+            ...session.user,
+            name: nextProfile.name || profileDraft.name,
+            avatarUrl: nextProfile.avatarUrl || undefined,
+          },
+        })
+      }
+    } catch (currentError) {
+      setProfileError(currentError instanceof Error ? currentError.message : 'บันทึกโปรไฟล์ไม่สำเร็จ')
+    } finally {
+      setSavingProfile(false)
     }
   }
 
@@ -558,16 +831,10 @@ export default function TeacherDashboard() {
 
     try {
       let coverImage = draft.coverImageUrl.trim() || editingCourse?.coverImage || defaultCover
-      let videoUrl = draft.videoUrl || editingCourse?.lessons[0]?.videoUrl || ''
 
       if (coverFile) {
         const uploadedCover = await api.uploadAsset({ kind: 'cover', file: coverFile })
         coverImage = uploadedCover.fileUrl
-      }
-
-      if (videoFile && !draft.videoUrl) {
-        const uploadedVideo = await api.uploadAsset({ kind: 'video', file: videoFile })
-        videoUrl = uploadedVideo.fileUrl
       }
 
       const payload = {
@@ -582,11 +849,6 @@ export default function TeacherDashboard() {
           .split('\n')
           .map((item) => item.trim())
           .filter(Boolean),
-        lessonTitle: draft.lessonTitle || 'บทเรียนที่ 1',
-        lessonSummary: draft.lessonSummary || 'เริ่มต้นคอร์สนี้ด้วยวิดีโอแนะนำบทเรียน',
-        lessonDuration: draft.lessonDuration || '00:00',
-        lessonPreview: draft.lessonPreview,
-        videoUrl: videoUrl || undefined,
       }
 
       const course =
@@ -638,6 +900,30 @@ export default function TeacherDashboard() {
     }
   }
 
+  const toggleCourseStatus = async (course: Course) => {
+    const currentStatus = course.status ?? 'published'
+    const nextStatus: Course['status'] = currentStatus === 'published' ? 'hidden' : 'published'
+
+    setUpdatingStatusSlug(course.slug)
+    setMessage(null)
+
+    try {
+      const nextCourse = await api.updateCourseStatus(course.slug, nextStatus)
+      setCourses((current) => current.map((item) => (item.slug === course.slug ? nextCourse : item)))
+      setMessage({
+        tone: 'success',
+        text: nextStatus === 'published' ? 'เผยแพร่คอร์สเรียบร้อยแล้ว' : 'ซ่อนคอร์สเรียบร้อยแล้ว',
+      })
+    } catch (currentError) {
+      setMessage({
+        tone: 'error',
+        text: currentError instanceof Error ? currentError.message : 'เปลี่ยนสถานะคอร์สไม่สำเร็จ',
+      })
+    } finally {
+      setUpdatingStatusSlug(null)
+    }
+  }
+
   if (loading) {
     return <div className="card p-6 text-sm text-slate-500">กำลังโหลดพื้นที่ทำงานของคุณครู...</div>
   }
@@ -646,7 +932,103 @@ export default function TeacherDashboard() {
     return <div className="card p-6 text-sm text-rose-600">{error}</div>
   }
 
-  if (!data) return null
+  if (!data || !currentTeacherProfile) return null
+
+  if (activeSection === 'profile') {
+    return (
+      <div className="space-y-6">
+        <section className="card p-5 sm:p-6">
+          <h1 className="text-2xl font-semibold text-slate-950">โปรไฟล์คุณครู</h1>
+          <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-600">
+            แก้ไขชื่อ รูปโปรไฟล์ และข้อมูลติดต่อที่ใช้แสดงในระบบ
+          </p>
+        </section>
+
+        <section className="card overflow-hidden">
+          <form className="grid gap-0 lg:grid-cols-[280px_minmax(0,1fr)]" onSubmit={saveTeacherProfile}>
+            <div className="border-b border-slate-200 bg-slate-50 p-5 lg:border-b-0 lg:border-r">
+              <div className="flex flex-col items-start gap-4">
+                {profileDraft.avatarUrl ? (
+                  <img src={profileDraft.avatarUrl} alt="รูปโปรไฟล์" className="h-32 w-32 rounded-lg object-cover" />
+                ) : (
+                  <span className="inline-flex h-32 w-32 items-center justify-center rounded-lg bg-slate-950 text-white">
+                    <UserRound size={40} />
+                  </span>
+                )}
+
+                <div>
+                  <p className="text-sm font-semibold text-slate-950">รูปโปรไฟล์</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-500">รองรับ JPG, PNG, WEBP ไม่เกิน 5MB</p>
+                  <label className="btn-secondary mt-3 inline-flex cursor-pointer px-3 py-2">
+                    <Camera size={16} />
+                    {uploadingAvatar ? 'กำลังอัปโหลด...' : 'อัปโหลดรูป'}
+                    <input
+                      type="file"
+                      className="hidden"
+                      accept="image/jpeg,image/png,image/webp"
+                      disabled={uploadingAvatar}
+                      onChange={(event) => handleProfileAvatarChange(event.target.files?.[0])}
+                    />
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-4 p-5">
+              <label className="block">
+                <span className="field-label">ชื่อที่แสดง</span>
+                <input
+                  className="field-input"
+                  value={profileDraft.name}
+                  onChange={(event) => setProfileDraft((current) => ({ ...current, name: event.target.value }))}
+                  placeholder="ชื่อคุณครู"
+                  required
+                />
+              </label>
+
+              <label className="block">
+                <span className="field-label">ตำแหน่ง / ความเชี่ยวชาญ</span>
+                <input
+                  className="field-input"
+                  value={profileDraft.headline}
+                  onChange={(event) => setProfileDraft((current) => ({ ...current, headline: event.target.value }))}
+                  placeholder="เช่น Frontend Instructor"
+                />
+              </label>
+
+              <label className="block">
+                <span className="field-label">เกี่ยวกับคุณครู</span>
+                <textarea
+                  className="field-input min-h-28 resize-y"
+                  value={profileDraft.bio}
+                  onChange={(event) => setProfileDraft((current) => ({ ...current, bio: event.target.value }))}
+                  placeholder="แนะนำประสบการณ์การสอนหรือแนวทางการสอน"
+                />
+              </label>
+
+              <label className="block">
+                <span className="field-label">เบอร์ติดต่อ</span>
+                <input
+                  className="field-input"
+                  value={profileDraft.phone}
+                  onChange={(event) => setProfileDraft((current) => ({ ...current, phone: event.target.value }))}
+                  placeholder="เบอร์ติดต่อ"
+                />
+              </label>
+
+              {profileError ? <p className="rounded-md bg-rose-50 p-3 text-sm text-rose-700">{profileError}</p> : null}
+
+              <div className="flex justify-end border-t border-slate-200 pt-4">
+                <button type="submit" className="btn-primary" disabled={savingProfile || uploadingAvatar}>
+                  {savingProfile ? 'กำลังบันทึก...' : 'บันทึกโปรไฟล์'}
+                </button>
+              </div>
+            </div>
+          </form>
+        </section>
+      </div>
+    )
+  }
 
   return (
     <>
@@ -687,7 +1069,7 @@ export default function TeacherDashboard() {
             </p>
           </div>
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[720px] border-collapse">
+            <table className="w-full min-w-[880px] border-collapse">
               <thead className="bg-slate-50 text-xs font-semibold uppercase text-slate-500">
                 <tr>
                   <th className="table-cell">คอร์ส</th>
@@ -704,7 +1086,16 @@ export default function TeacherDashboard() {
                       <div className="flex items-center gap-3">
                         <img src={course.coverImage} alt={course.title} className="h-12 w-16 rounded-md object-cover" />
                         <div>
-                          <p className="font-medium text-slate-950">{course.title}</p>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="font-medium text-slate-950">{course.title}</p>
+                            <span
+                              className={`rounded-full border px-2 py-0.5 text-xs font-medium ${
+                                getCourseStatusMeta(course.status).badgeClass
+                              }`}
+                            >
+                              {getCourseStatusMeta(course.status).label}
+                            </span>
+                          </div>
                           <p className="text-xs text-slate-500">
                             {course.lessonCount ?? course.lessons.length} บทเรียน
                           </p>
@@ -715,10 +1106,29 @@ export default function TeacherDashboard() {
                     <td className="table-cell text-slate-600">{course.price.toLocaleString('th-TH')} บาท</td>
                     <td className="table-cell text-slate-600">{course.students.toLocaleString('th-TH')}</td>
                     <td className="table-cell">
-                      <div className="flex gap-2">
+                      <div className="flex flex-wrap gap-2">
                         <button type="button" className="btn-secondary px-3 py-2" onClick={() => openEditModal(course)}>
                           <Edit3 size={15} />
                           แก้ไข
+                        </button>
+                        <button type="button" className="btn-secondary px-3 py-2" onClick={() => openLessonManager(course)}>
+                          <Video size={15} />
+                          บทเรียน
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-secondary px-3 py-2"
+                          onClick={() => toggleCourseStatus(course)}
+                          disabled={updatingStatusSlug === course.slug}
+                        >
+                          {updatingStatusSlug === course.slug ? (
+                            <LoaderCircle size={15} className="animate-spin" />
+                          ) : (course.status ?? 'published') === 'published' ? (
+                            <EyeOff size={15} />
+                          ) : (
+                            <Eye size={15} />
+                          )}
+                          {getCourseStatusMeta(course.status).actionLabel}
                         </button>
                         <button
                           type="button"
@@ -743,17 +1153,13 @@ export default function TeacherDashboard() {
           mode={formMode}
           draft={draft}
           coverPreview={coverPreview}
-          videoPreview={videoPreview}
           coverFile={coverFile}
-          videoFile={videoFile}
-          uploadingVideo={uploadingVideo}
           formMessage={message}
           saving={saving}
           onClose={closeFormModal}
           onSubmit={handleSubmit}
           onDraftChange={handleDraftChange}
           onCoverChange={handleCoverChange}
-          onVideoChange={handleVideoChange}
         />
       ) : null}
 
@@ -763,6 +1169,24 @@ export default function TeacherDashboard() {
           deleting={deletingSlug === deleteTarget.slug}
           onCancel={() => setDeleteTarget(null)}
           onConfirm={handleDelete}
+        />
+      ) : null}
+
+      {lessonCourse ? (
+        <LessonManagerModal
+          course={lessonCourse}
+          draft={lessonDraft}
+          editingLessonId={editingLessonId}
+          saving={savingLesson}
+          uploading={uploadingLessonVideo}
+          message={lessonMessage}
+          onClose={closeLessonManager}
+          onNew={startNewLesson}
+          onSelect={selectLesson}
+          onDraftChange={handleLessonDraftChange}
+          onVideoChange={handleLessonVideoChange}
+          onSubmit={saveLesson}
+          onDelete={deleteLesson}
         />
       ) : null}
     </>

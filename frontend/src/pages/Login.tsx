@@ -1,7 +1,18 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { LogIn } from 'lucide-react'
-import { api, authStorage } from '../services/api'
+import { api, authStorage, type AuthSession } from '../services/api'
+
+async function getPostLoginPath(session: AuthSession) {
+  if (session.user.role !== 'student') return session.dashboardPath
+
+  try {
+    const dashboard = await api.getStudentDashboard()
+    return dashboard.courses.length > 0 ? session.dashboardPath : '/courses'
+  } catch {
+    return session.dashboardPath
+  }
+}
 
 export default function Login() {
   const navigate = useNavigate()
@@ -21,7 +32,7 @@ export default function Login() {
         password: String(formData.get('password')),
       })
       authStorage.setSession(session)
-      navigate(session.dashboardPath)
+      navigate(await getPostLoginPath(session))
     } catch (currentError) {
       setError(currentError instanceof Error ? currentError.message : 'เข้าสู่ระบบไม่สำเร็จ')
     } finally {

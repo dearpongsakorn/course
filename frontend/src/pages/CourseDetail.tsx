@@ -1,16 +1,18 @@
-import { useEffect, useState } from 'react'
+﻿import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import {
   ArrowRight,
   BookOpenCheck,
   CheckCircle2,
   Clock3,
+  CreditCard,
   PlayCircle,
+  ShoppingCart,
   Star,
   Users,
 } from 'lucide-react'
 import VideoPlayer from '../components/VideoPlayer'
-import { api, authStorage } from '../services/api'
+import { api, authStorage, cartStorage } from '../services/api'
 import type { Course } from '../types/course'
 
 const formatPrice = (price: number) =>
@@ -29,6 +31,7 @@ export default function CourseDetail() {
   const [error, setError] = useState<string | null>(null)
   const [enrolling, setEnrolling] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
+  const [cartAdded, setCartAdded] = useState(false)
 
   useEffect(() => {
     let active = true
@@ -43,7 +46,17 @@ export default function CourseDetail() {
       api
         .getCourse(slug)
         .then((result) => {
-          if (active) setCourse(result)
+          if (!active) return
+
+          if (result.viewerState?.role === 'student' && result.viewerState.isEnrolled) {
+            const lastLessonId = result.viewerState.enrollment?.lastLessonId
+            navigate(lastLessonId ? `/learn/${result.slug}?lesson=${lastLessonId}` : `/learn/${result.slug}`, {
+              replace: true,
+            })
+            return
+          }
+
+          setCourse(result)
         })
         .catch((currentError: Error) => {
           if (active) setError(currentError.message)
@@ -56,7 +69,7 @@ export default function CourseDetail() {
     return () => {
       active = false
     }
-  }, [slug])
+  }, [navigate, slug])
 
   if (loading) {
     return (
@@ -98,21 +111,22 @@ export default function CourseDetail() {
 
     try {
       const result = await api.enrollCourse(course.slug)
-      setCourse({
-        ...course,
-        students: course.students + (isEnrolled ? 0 : 1),
-        viewerState: {
-          role: 'student',
-          isEnrolled: true,
-          canEnroll: false,
-          enrollment: result.enrollment,
-        },
-      })
+      navigate(
+        result.enrollment.lastLessonId
+          ? `/learn/${course.slug}?lesson=${result.enrollment.lastLessonId}`
+          : `/learn/${course.slug}`,
+        { replace: true },
+      )
     } catch (currentError) {
       setActionError(currentError instanceof Error ? currentError.message : 'ไม่สามารถสมัครเรียนได้')
     } finally {
       setEnrolling(false)
     }
+  }
+
+  const handleAddToCart = () => {
+    cartStorage.addItem(course.slug)
+    setCartAdded(true)
   }
 
   return (
@@ -169,10 +183,20 @@ export default function CourseDetail() {
                     <ArrowRight size={16} />
                   </Link>
                 ) : isStudent ? (
-                  <button type="button" className="btn-primary" onClick={handleEnroll} disabled={enrolling}>
-                    {enrolling ? 'กำลังสมัครเรียน...' : 'สมัครเรียนคอร์สนี้'}
-                    <ArrowRight size={16} />
-                  </button>
+                  <>
+                    <button type="button" className="btn-primary" onClick={handleEnroll} disabled={enrolling}>
+                      {enrolling ? 'กำลังซื้อคอร์ส...' : 'ซื้อคอร์ส'}
+                      <CreditCard size={16} className="text-emerald-300" />
+                    </button>
+                    <button
+                      type="button"
+                      className="inline-flex items-center justify-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm font-medium text-amber-800 transition hover:bg-amber-100"
+                      onClick={handleAddToCart}
+                    >
+                      <ShoppingCart size={16} className="text-amber-600" />
+                      {cartAdded ? 'เพิ่มในตะกร้าแล้ว' : 'เพิ่มตะกร้า'}
+                    </button>
+                  </>
                 ) : (
                   <Link to={session ? session.dashboardPath : '/login'} className="btn-primary">
                     {session ? 'ไปยังหน้าของฉัน' : 'เข้าสู่ระบบเพื่อสมัครเรียน'}
@@ -300,3 +324,4 @@ export default function CourseDetail() {
     </>
   )
 }
+

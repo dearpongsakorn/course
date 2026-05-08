@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useEffect, useState } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { BookOpenCheck, Camera, Clock3, Trophy, UserRound } from 'lucide-react'
 import CourseCard from '../components/CourseCard'
 import { useApi } from '../hooks/useApi'
@@ -13,31 +13,51 @@ const emptyProfile: ProfileDraft = {
 }
 
 export default function StudentDashboard() {
+  const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const activeSection = searchParams.get('section') === 'profile' ? 'profile' : 'courses'
   const { data, error, loading } = useApi(() => api.getStudentDashboard(), [])
   const [profile, setProfile] = useState<StudentProfile | null>(null)
   const [draft, setDraft] = useState<ProfileDraft>(emptyProfile)
-  const [draftReadyForUserId, setDraftReadyForUserId] = useState<string | null>(null)
   const [profileError, setProfileError] = useState<string | null>(null)
   const [savingProfile, setSavingProfile] = useState(false)
   const [uploadingAvatar, setUploadingAvatar] = useState(false)
 
+  const currentProfile = data ? (profile ?? data.profile) : null
+
+  useEffect(() => {
+    if (!data || !currentProfile) return
+
+    const nextDraft = {
+      name: currentProfile.name || data.user.name,
+      avatarUrl: currentProfile.avatarUrl || data.user.avatarUrl || '',
+    }
+
+    setDraft(nextDraft)
+  }, [
+    currentProfile?.avatarUrl,
+    currentProfile?.name,
+    currentProfile?.updatedAt,
+    data?.user.avatarUrl,
+    data?.user.id,
+    data?.user.name,
+  ])
+
+  useEffect(() => {
+    if (loading || error || !data || activeSection !== 'courses') return
+    if (data.courses.length === 0) navigate('/courses', { replace: true })
+  }, [activeSection, data, error, loading, navigate])
+
   if (loading) return <div className="card p-6 text-sm text-slate-500">กำลังโหลดข้อมูลผู้เรียนจากฐานข้อมูล...</div>
   if (error) return <div className="card p-6 text-sm text-rose-600">{error}</div>
-  if (!data) return null
+  if (!data || !currentProfile) return null
 
-  const currentProfile = profile ?? data.profile
   const displayName = currentProfile.name || data.user.name
   const avatarUrl = currentProfile.avatarUrl || data.user.avatarUrl || ''
-
-  if (draftReadyForUserId !== data.user.id) {
-    setDraft({
-      name: displayName,
-      avatarUrl,
-    })
-    setDraftReadyForUserId(data.user.id)
-  }
+  const learningPathFor = (item: (typeof data.courses)[number]) =>
+    item.enrollment.lastLessonId
+      ? `/learn/${item.course.slug}?lesson=${item.enrollment.lastLessonId}`
+      : `/learn/${item.course.slug}`
 
   const handleAvatarChange = async (file: File | undefined) => {
     if (!file) return
@@ -64,10 +84,10 @@ export default function StudentDashboard() {
       const nextProfile = await api.updateStudentProfile({
         name: draft.name,
         avatarUrl: draft.avatarUrl,
-        headline: '',
-        bio: '',
-        learningGoal: '',
-        phone: '',
+        headline: currentProfile.headline,
+        bio: currentProfile.bio,
+        learningGoal: currentProfile.learningGoal,
+        phone: currentProfile.phone,
       })
       setProfile(nextProfile)
 
@@ -206,7 +226,8 @@ export default function StudentDashboard() {
               course={item.course}
               progress={item.enrollment.progress}
               ctaLabel="เรียนต่อ"
-              ctaTo={`/learn/${item.course.slug}`}
+              ctaTo={learningPathFor(item)}
+              cardTo={learningPathFor(item)}
               showDescription={false}
             />
           ))}

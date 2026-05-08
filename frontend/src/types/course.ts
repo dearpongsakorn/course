@@ -44,6 +44,7 @@ export interface Course {
   lessonCount?: number
   outcomes: string[]
   isPopular?: boolean
+  status: 'draft' | 'published' | 'hidden'
   updatedAt: string
   viewerState?: {
     role: 'student' | 'teacher' | 'admin' | null

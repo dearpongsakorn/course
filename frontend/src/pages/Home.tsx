@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom'
 import {
   ArrowRight,
+  Fingerprint,
   Bot,
   CheckCircle2,
   MessageSquareText,
@@ -57,14 +58,8 @@ export default function Home() {
               โดยข้อมูลคอร์สทั้งหมดมาจากฐานข้อมูลจริงผ่าน backend API
             </p>
             <div className="mt-8 flex flex-col gap-3 sm:flex-row">
-              <Link to="/register" className="btn-primary bg-white text-slate-950 hover:bg-slate-200">
-                สมัครสมาชิก
-                <ArrowRight size={17} />
-              </Link>
-              <Link
-                to="/login"
-                className="inline-flex items-center justify-center gap-2 rounded-md border border-white/40 bg-white/10 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-white/20"
-              >
+              <Link to="/login" className="btn-primary bg-white text-slate-950 hover:bg-slate-200">
+                <Fingerprint size={17} />
                 เข้าสู่ระบบ
               </Link>
             </div>

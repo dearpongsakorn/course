@@ -94,6 +94,9 @@ const toUser = (row) => ({
   avatarUrl: row.avatar_url ?? undefined,
   status: row.status,
   createdAt: row.created_at,
+  isOnline: row.is_online ?? undefined,
+  activeSessions: row.active_sessions !== undefined ? Number(row.active_sessions) : undefined,
+  lastSeenAt: row.last_seen_at ?? undefined,
 })
 
 const hashPassword = (password, salt = crypto.randomBytes(16).toString('hex')) => {
@@ -162,6 +165,19 @@ const ensureAiSchema = async () => {
   `)
 }
 
+const ensureCourseSchema = async () => {
+  await query(`
+    ALTER TABLE courses
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'published'
+  `)
+
+  await query(`
+    UPDATE courses
+    SET status = 'published'
+    WHERE status IS NULL OR status = ''
+  `)
+}
+
 const getLessonContent = async (lessonId) => {
   const result = await query(
     `
@@ -169,7 +185,9 @@ const getLessonContent = async (lessonId) => {
         l.id,
         l.title,
         l.summary,
-        COALESCE(t.transcript, l.summary) AS content
+        COALESCE(t.transcript, l.summary) AS content,
+        t.transcript AS transcript,
+        t.source AS transcript_source
       FROM lessons l
       LEFT JOIN lesson_transcripts t ON t.lesson_id = l.id
       WHERE l.id = $1
@@ -211,14 +229,28 @@ const ensureGeminiClient = () => {
 
 const callGemini = async (prompt, { json = false } = {}) => {
   const client = ensureGeminiClient()
-  const response = await client.models.generateContent({
-    model: aiModel,
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    config: {
-      temperature: 0.2,
-      ...(json ? { responseMimeType: 'application/json' } : {}),
-    },
-  })
+  let response
+
+  try {
+    response = await client.models.generateContent({
+      model: aiModel,
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      config: {
+        temperature: 0.2,
+        ...(json ? { responseMimeType: 'application/json' } : {}),
+      },
+    })
+  } catch (error) {
+    const status = Number(error?.status ?? error?.statusCode ?? 500)
+    const message = String(error?.message ?? '')
+    const friendlyError = new Error(
+      status === 429 || message.toLowerCase().includes('quota')
+        ? 'AI ใช้งานเกินโควต้า Gemini ชั่วคราว กรุณารอสักครู่แล้วลองใหม่'
+        : message || 'ไม่สามารถเชื่อมต่อ Gemini ได้',
+    )
+    friendlyError.statusCode = status === 429 ? 429 : status >= 400 && status < 500 ? status : 503
+    throw friendlyError
+  }
 
   const text = getGeminiText(response)
   if (!text) throw new Error('Gemini did not return text')
@@ -403,11 +435,14 @@ const transcribeVideoWithGemini = async (absolutePath) => {
   const client = ensureGeminiClient()
   const mediaBuffer = await readFile(absolutePath)
   const prompt = `
-ถอดสคริปต์เสียงพูดจากวิดีโอนี้เป็นภาษาไทย
-- ถอดเฉพาะคำพูดที่ได้ยินจริง
+ถอดเสียงพูดจากวิดีโอนี้เป็นภาษาไทย พร้อม timestamp เพื่อใช้ทำ AI Summary แบบอ้างอิงเวลา
+
+กติกา:
+- ถอดเฉพาะคำพูดที่ได้ยินจริง ห้ามแต่งเนื้อหาเพิ่ม
+- ใส่ timestamp ทุกช่วงที่ผู้พูดเริ่มประเด็นใหม่ หรืออย่างน้อยทุก 15-30 วินาที
+- รูปแบบแต่ละบรรทัดต้องเป็น: [MM:SS] คำพูดที่ได้ยิน
 - ถ้าเสียงไม่ชัดให้ใส่ [ไม่ชัดเจน] เฉพาะจุดนั้น
-- ห้ามแต่งเนื้อหาเพิ่ม
-- ส่งกลับเป็นข้อความ transcript เท่านั้น
+- ส่งกลับเฉพาะ transcript ไม่ต้องสรุป
 `
   const response = await client.models.generateContent({
     model: transcribeModel,
@@ -744,12 +779,27 @@ const summarizeLesson = async (lessonId) => {
 
   if (!lesson) return { statusCode: 404, payload: { message: 'Lesson not found' } }
 
+  const hasTimestamp = /\[(?:\d{1,2}:)?\d{1,2}:\d{2}\]/.test(String(lesson.content ?? ''))
+  const timestampRule = hasTimestamp
+    ? '- ใช้ timestamp จาก transcript เท่านั้น ห้ามเดาเวลาใหม่'
+    : '- transcript นี้ยังไม่มี timestamp ให้เขียนประโยคนี้ก่อน timeline: "ยังไม่มี timestamp ใน transcript จึงระบุนาทีแบบแม่นยำไม่ได้" แล้วแบ่งเป็น "ช่วงที่ 1", "ช่วงที่ 2" ตามลำดับเนื้อหาแทน'
+
   const prompt = `
 คุณคือผู้ช่วยสอนออนไลน์ภาษาไทย
-สรุปเนื้อหาบทเรียนนี้ให้อ่านง่าย แบ่งเป็น:
-1. สรุปภาพรวม 1 ย่อหน้า
-2. ประเด็นสำคัญ 5 ข้อ
-3. สิ่งที่ผู้เรียนควรจำ
+สรุปบทเรียนนี้จาก transcript/summary ที่ให้มา โดยต้องช่วยผู้เรียนรู้ว่าแต่ละช่วงเวลาพูดอะไร
+
+รูปแบบคำตอบที่ต้องการ:
+1. ภาพรวมบทเรียน 1 ย่อหน้า
+2. Timeline คำพูดสำคัญ
+   - ถ้ามี timestamp ให้ใช้รูปแบบ: [MM:SS] "คำพูดสั้น ๆ จาก transcript" — อธิบายความหมาย/ประเด็น
+   - เลือก 5-8 ช่วงที่สำคัญที่สุด
+   - ข้อความในเครื่องหมายคำพูดต้องยกจาก transcript สั้น ๆ ห้ามแต่งคำพูดใหม่
+3. ประเด็นที่ควรจำ 3-5 ข้อ
+
+กติกา:
+${timestampRule}
+- ถ้าข้อมูลไม่พอ ให้บอกตรง ๆ ว่าข้อมูลในบทเรียนยังไม่พอ
+- ตอบเป็นภาษาไทย กระชับ อ่านง่าย
 
 ชื่อบทเรียน: ${lesson.title}
 เนื้อหา:
@@ -773,8 +823,13 @@ const askLessonAi = async (request, lessonId) => {
   if (!lesson) return { statusCode: 404, payload: { message: 'Lesson not found' } }
 
   const prompt = `
-ตอบคำถามจากเนื้อหาบทเรียนเท่านั้น ถ้าไม่มีข้อมูลให้บอกว่า "ในบทเรียนนี้ยังไม่มีข้อมูลส่วนนั้น"
-ตอบเป็นภาษาไทย กระชับ และยกเหตุผลจากเนื้อหา
+ตอบคำถามจากเนื้อหาบทเรียนนี้เท่านั้น ห้ามเดาความรู้จากนอกบทเรียน
+
+กติกา:
+- ถ้ามี timestamp ใน transcript และคำตอบเกี่ยวกับช่วงใด ให้ระบุ timestamp ที่เกี่ยวข้อง เช่น [03:15]
+- ถ้าต้องอ้างคำพูด ให้ยกคำพูดสั้น ๆ จาก transcript และอธิบายต่อด้วยภาษาของคุณ
+- ถ้าไม่มีข้อมูลในบทเรียน ให้ตอบว่า "ในบทเรียนนี้ยังไม่มีข้อมูลส่วนนั้น"
+- ตอบเป็นภาษาไทย กระชับ และชัดเจน
 
 ชื่อบทเรียน: ${lesson.title}
 เนื้อหา:
@@ -1041,6 +1096,7 @@ const toCourseSummary = (row) => ({
   lessonCount: Number(row.lesson_count ?? 0),
   outcomes: row.outcomes ?? [],
   isPopular: row.is_popular,
+  status: row.status,
   updatedAt: row.updated_at,
 })
 
@@ -1059,9 +1115,14 @@ const courseSelect = `
   JOIN users u ON u.id = c.teacher_id
 `
 
-const getCourses = async ({ popular, teacherId } = {}) => {
-  const clauses = ['c.status = $1']
-  const values = ['published']
+const getCourses = async ({ popular, teacherId, includeUnpublished = false } = {}) => {
+  const clauses = []
+  const values = []
+
+  if (!includeUnpublished) {
+    values.push('published')
+    clauses.push(`c.status = $${values.length}`)
+  }
 
   if (popular) {
     values.push(true)
@@ -1074,7 +1135,7 @@ const getCourses = async ({ popular, teacherId } = {}) => {
   }
 
   const result = await query(
-    `${courseSelect} WHERE ${clauses.join(' AND ')} ORDER BY c.updated_at DESC`,
+    `${courseSelect}${clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''} ORDER BY c.updated_at DESC`,
     values,
   )
 
@@ -1184,6 +1245,11 @@ const getCourseForViewer = async (slug, viewer) => {
   const course = await getCourseBySlug(slug)
 
   if (!course) return null
+
+  const canManage =
+    viewer?.role === 'admin' || (viewer?.role === 'teacher' && course.instructor.id === viewer.id)
+
+  if (course.status !== 'published' && !canManage) return null
 
   let enrollment = null
 
@@ -1370,6 +1436,49 @@ const updateStudentProfile = async (request) => {
   return { statusCode: 200, payload: { data: await getUserProfile(authUser.id) } }
 }
 
+const updateTeacherProfile = async (request) => {
+  const authUser = await getAuthUser(request)
+
+  if (!authUser || authUser.role !== 'teacher') {
+    return { statusCode: 401, payload: { message: 'กรุณาเข้าสู่ระบบด้วยบัญชีคุณครู' } }
+  }
+
+  const body = await readBody(request)
+  const name = String(body.name ?? '').trim()
+  const headline = String(body.headline ?? '').trim()
+  const bio = String(body.bio ?? '').trim()
+  const learningGoal = String(body.learningGoal ?? '').trim()
+  const phone = String(body.phone ?? '').trim()
+  const avatarUrl = String(body.avatarUrl ?? '').trim()
+
+  if (!name) {
+    return { statusCode: 400, payload: { message: 'กรุณากรอกชื่อ' } }
+  }
+
+  await query(
+    `
+      INSERT INTO user_profiles (user_id, headline, bio, learning_goal, phone, updated_at)
+      VALUES ($1, $2, $3, $4, $5, NOW())
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        headline = EXCLUDED.headline,
+        bio = EXCLUDED.bio,
+        learning_goal = EXCLUDED.learning_goal,
+        phone = EXCLUDED.phone,
+        updated_at = NOW()
+    `,
+    [authUser.id, headline, bio, learningGoal, phone],
+  )
+
+  await query('UPDATE users SET name = $1, avatar_url = $2 WHERE id = $3', [
+    name,
+    avatarUrl || null,
+    authUser.id,
+  ])
+
+  return { statusCode: 200, payload: { data: await getUserProfile(authUser.id) } }
+}
+
 const getTeacherDashboard = async (teacherId) => {
   const userResult = await query('SELECT * FROM users WHERE id = $1 AND role = $2 LIMIT 1', [
     teacherId,
@@ -1379,27 +1488,40 @@ const getTeacherDashboard = async (teacherId) => {
 
   if (!user) return null
 
-  const courseSummaries = await getCourses({ teacherId })
+  const courseSummaries = await getCourses({ teacherId, includeUnpublished: true })
   const courses = (
     await Promise.all(courseSummaries.map((course) => getCourseBySlug(course.slug)))
   ).filter(Boolean)
 
   return {
     user: toUser(user),
+    profile: await getUserProfile(teacherId),
     courses,
   }
 }
 
 const getAdminDashboard = async () => {
   const [usersResult, courses, statsResult] = await Promise.all([
-    query('SELECT * FROM users ORDER BY created_at DESC'),
+    query(`
+      SELECT
+        u.*,
+        COUNT(s.token)::int AS active_sessions,
+        COALESCE(COUNT(s.token) > 0, false) AS is_online,
+        MAX(s.created_at) AS last_seen_at
+      FROM users u
+      LEFT JOIN auth_sessions s ON s.user_id = u.id AND s.expires_at > NOW()
+      GROUP BY u.id
+      ORDER BY u.created_at DESC
+    `),
     getCourses(),
     query(`
       SELECT
         COUNT(*)::int AS total_users,
         COUNT(*) FILTER (WHERE role = 'teacher')::int AS total_teachers,
-        COUNT(*) FILTER (WHERE role = 'student')::int AS total_students
-      FROM users
+        COUNT(*) FILTER (WHERE role = 'student')::int AS total_students,
+        COUNT(DISTINCT s.user_id)::int AS active_users
+      FROM users u
+      LEFT JOIN auth_sessions s ON s.user_id = u.id AND s.expires_at > NOW()
     `),
   ])
 
@@ -1411,6 +1533,7 @@ const getAdminDashboard = async () => {
       totalCourses: courses.length,
       totalTeachers: statsResult.rows[0].total_teachers,
       totalStudents: statsResult.rows[0].total_students,
+      activeUsers: statsResult.rows[0].active_users,
     },
   }
 }
@@ -1458,7 +1581,7 @@ const createCourse = async (request) => {
         id, slug, teacher_id, title, description, cover_image, price, category,
         level, duration, rating, students, outcomes, is_popular, status, updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 0, $11, false, 'published', CURRENT_DATE)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 0, $11, false, 'draft', CURRENT_DATE)
       RETURNING slug
     `,
     [
@@ -1553,67 +1676,132 @@ const updateCourse = async (request, slug) => {
     ],
   )
 
-  const lessonResult = await query(
-    `
-      SELECT id
-      FROM lessons
-      WHERE course_id = $1
-      ORDER BY sort_order
-      LIMIT 1
-    `,
-    [permission.course.id],
-  )
-  const firstLesson = lessonResult.rows[0]
+  return { statusCode: 200, payload: { data: await getCourseBySlug(nextSlug) } }
+}
 
-  if (firstLesson) {
+const saveCourseLesson = async (request, slug, lessonId) => {
+  const authUser = await getAuthUser(request)
+  const permission = await getManageableCourseBySlug(slug, authUser)
+
+  if (permission.statusCode !== 200) {
+    return permission
+  }
+
+  const body = await readBody(request)
+  const title = String(body.title ?? '').trim()
+  const duration = String(body.duration ?? '').trim() || '00:00'
+  const summary = String(body.summary ?? '').trim()
+  const preview = Boolean(body.preview)
+  const videoUrl = String(body.videoUrl ?? '').trim()
+
+  if (!title) {
+    return { statusCode: 400, payload: { message: 'กรุณากรอกชื่อบทเรียน' } }
+  }
+
+  if (lessonId) {
+    const lessonResult = await query(
+      `
+        SELECT id
+        FROM lessons
+        WHERE id = $1 AND course_id = $2
+        LIMIT 1
+      `,
+      [lessonId, permission.course.id],
+    )
+
+    if (!lessonResult.rows[0]) {
+      return { statusCode: 404, payload: { message: 'Lesson not found' } }
+    }
+
     await query(
       `
         UPDATE lessons
-        SET
-          title = $1,
-          duration = $2,
-          preview = $3,
-          video_url = $4,
-          summary = $5
+        SET title = $1, duration = $2, preview = $3, video_url = $4, summary = $5
         WHERE id = $6
       `,
-      [
-        String(body.lessonTitle ?? 'บทเรียนที่ 1'),
-        String(body.lessonDuration ?? '00:00'),
-        Boolean(body.lessonPreview ?? true),
-        body.videoUrl ? String(body.videoUrl) : null,
-        String(body.lessonSummary ?? 'บทเรียนแรกของคอร์สนี้'),
-        firstLesson.id,
-      ],
+      [title, duration, preview, videoUrl || null, summary, lessonId],
     )
 
-    if (body.videoUrl) {
-      await autoTranscribeLesson(firstLesson.id, String(body.videoUrl))
+    if (videoUrl) {
+      await autoTranscribeLesson(lessonId, videoUrl)
     }
-  } else if (body.lessonTitle || body.videoUrl || body.lessonSummary) {
-    const lessonId = `lesson-${crypto.randomUUID()}`
+  } else {
+    const sortResult = await query(
+      'SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_sort_order FROM lessons WHERE course_id = $1',
+      [permission.course.id],
+    )
+    const nextLessonId = `lesson-${crypto.randomUUID()}`
+
     await query(
       `
         INSERT INTO lessons (id, course_id, title, duration, preview, video_url, summary, sort_order)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 1)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       `,
       [
-        lessonId,
+        nextLessonId,
         permission.course.id,
-        String(body.lessonTitle ?? 'บทเรียนที่ 1'),
-        String(body.lessonDuration ?? '00:00'),
-        Boolean(body.lessonPreview ?? true),
-        body.videoUrl ? String(body.videoUrl) : null,
-        String(body.lessonSummary ?? 'บทเรียนแรกของคอร์สนี้'),
+        title,
+        duration,
+        preview,
+        videoUrl || null,
+        summary,
+        Number(sortResult.rows[0].next_sort_order),
       ],
     )
 
-    if (body.videoUrl) {
-      await autoTranscribeLesson(lessonId, String(body.videoUrl))
+    if (videoUrl) {
+      await autoTranscribeLesson(nextLessonId, videoUrl)
     }
   }
 
-  return { statusCode: 200, payload: { data: await getCourseBySlug(nextSlug) } }
+  return { statusCode: 200, payload: { data: await getCourseBySlug(permission.course.slug) } }
+}
+
+const updateCourseStatus = async (request, slug) => {
+  const authUser = await getAuthUser(request)
+  const permission = await getManageableCourseBySlug(slug, authUser)
+
+  if (permission.statusCode !== 200) {
+    return permission
+  }
+
+  const body = await readBody(request)
+  const status = String(body.status ?? '').trim()
+
+  if (!['draft', 'published', 'hidden'].includes(status)) {
+    return { statusCode: 400, payload: { message: 'สถานะคอร์สไม่ถูกต้อง' } }
+  }
+
+  await query('UPDATE courses SET status = $1, updated_at = CURRENT_DATE WHERE id = $2', [
+    status,
+    permission.course.id,
+  ])
+
+  return { statusCode: 200, payload: { data: await getCourseBySlug(permission.course.slug) } }
+}
+
+const deleteCourseLesson = async (request, slug, lessonId) => {
+  const authUser = await getAuthUser(request)
+  const permission = await getManageableCourseBySlug(slug, authUser)
+
+  if (permission.statusCode !== 200) {
+    return permission
+  }
+
+  const result = await query(
+    `
+      DELETE FROM lessons
+      WHERE id = $1 AND course_id = $2
+      RETURNING id
+    `,
+    [lessonId, permission.course.id],
+  )
+
+  if (!result.rows[0]) {
+    return { statusCode: 404, payload: { message: 'Lesson not found' } }
+  }
+
+  return { statusCode: 200, payload: { data: await getCourseBySlug(permission.course.slug) } }
 }
 
 const deleteCourse = async (request, slug) => {
@@ -1651,6 +1839,10 @@ const enrollInCourse = async (request, slug) => {
   const course = await getCourseBySlug(slug)
 
   if (!course) {
+    return { statusCode: 404, payload: { message: 'Course not found' } }
+  }
+
+  if (course.status !== 'published') {
     return { statusCode: 404, payload: { message: 'Course not found' } }
   }
 
@@ -1717,6 +1909,7 @@ const routeRequest = async (request, response) => {
   if (url.pathname === '/api/health' && request.method === 'GET') {
     await query('SELECT 1')
     await ensureAuthSchema()
+    await ensureCourseSchema()
     sendJson(response, 200, {
       status: 'ok',
       service: 'mycourse-backend',
@@ -1829,6 +2022,26 @@ const routeRequest = async (request, response) => {
     return
   }
 
+  if (url.pathname.startsWith('/api/courses/') && request.method === 'POST' && url.pathname.endsWith('/status')) {
+    const slug = decodeURIComponent(url.pathname.replace('/api/courses/', '').replace('/status', ''))
+    const result = await updateCourseStatus(request, slug)
+    sendJson(response, result.statusCode, result.payload)
+    return
+  }
+
+  if (url.pathname.startsWith('/api/courses/') && request.method === 'POST' && url.pathname.includes('/lessons')) {
+    const lessonPath = url.pathname.replace('/api/courses/', '')
+    const [encodedSlug, , encodedLessonId, action] = lessonPath.split('/')
+    const slug = decodeURIComponent(encodedSlug ?? '')
+    const lessonId = encodedLessonId ? decodeURIComponent(encodedLessonId) : ''
+    const result = action === 'delete'
+      ? await deleteCourseLesson(request, slug, lessonId)
+      : await saveCourseLesson(request, slug, lessonId || null)
+
+    sendJson(response, result.statusCode, result.payload)
+    return
+  }
+
   if (url.pathname.startsWith('/api/courses/') && request.method === 'POST' && url.pathname.endsWith('/delete')) {
     const slug = decodeURIComponent(url.pathname.replace('/api/courses/', '').replace('/delete', ''))
     const result = await deleteCourse(request, slug)
@@ -1879,6 +2092,12 @@ const routeRequest = async (request, response) => {
     return
   }
 
+  if (url.pathname === '/api/teacher/profile' && request.method === 'POST') {
+    const result = await updateTeacherProfile(request)
+    sendJson(response, result.statusCode, result.payload)
+    return
+  }
+
   if (url.pathname === '/api/admin/dashboard' && request.method === 'GET') {
     sendJson(response, 200, { data: await getAdminDashboard() })
     return
@@ -1914,6 +2133,7 @@ const server = http.createServer((request, response) => {
 })
 
 ensureAuthSchema()
+  .then(ensureCourseSchema)
   .then(ensureAiSchema)
   .then(normalizeExistingUploadedVideos)
   .then(() => {

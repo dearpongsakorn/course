@@ -3,11 +3,12 @@ import { Link } from 'react-router-dom'
 import { Search } from 'lucide-react'
 import CourseCard from '../components/CourseCard'
 import { useApi } from '../hooks/useApi'
-import { api } from '../services/api'
+import { api, authStorage } from '../services/api'
 
 const categoryOptions = ['ทั้งหมด', 'Technology', 'Business', 'Design', 'Marketing', 'Data']
 
 export default function Courses() {
+  const session = authStorage.getSession()
   const [searchTerm, setSearchTerm] = useState('')
   const [selectedCategory, setSelectedCategory] = useState('ทั้งหมด')
   const deferredSearchTerm = useDeferredValue(searchTerm)
@@ -86,8 +87,8 @@ export default function Courses() {
 
         <div className="mt-6 flex items-center justify-between text-sm text-slate-500">
           <p>{loading ? 'กำลังโหลดคอร์ส...' : `พบ ${filteredCourses.length} คอร์ส`}</p>
-          <Link to="/login" className="font-medium text-slate-950 hover:text-slate-700">
-            เข้าสู่ระบบเพื่อสมัครเรียน
+          <Link to={session ? session.dashboardPath : '/login'} className="font-medium text-slate-950 hover:text-slate-700">
+            {session ? 'ไปที่ Dashboard' : 'เข้าสู่ระบบเพื่อสมัครเรียน'}
           </Link>
         </div>
 
@@ -106,7 +107,7 @@ export default function Courses() {
         {!loading && !error && filteredCourses.length > 0 && (
           <div className="mt-6 grid gap-5 md:grid-cols-2 xl:grid-cols-3">
             {filteredCourses.map((course) => (
-              <CourseCard key={course.id} course={course} />
+              <CourseCard key={course.id} course={course} ctaLabel="ซื้อคอร์ส" showCartAction />
             ))}
           </div>
         )}

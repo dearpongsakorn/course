@@ -262,7 +262,7 @@ export default function VideoLearning() {
                 <div className="space-y-4 text-sm leading-6 text-slate-600">
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                     <div>
-                      <h3 className="text-base font-semibold text-slate-950">AI Summary</h3>
+                      <h3 className="text-base font-semibold text-slate-950">AI Summary Timeline</h3>
                       <p className="mt-1 text-sm text-slate-500">อ่านภาพรวมของบทนี้แบบสั้น กระชับ และนำไปใช้ต่อได้ง่าย</p>
                     </div>
                     <button
@@ -271,7 +271,7 @@ export default function VideoLearning() {
                       onClick={generateSummary}
                       disabled={aiLoading === 'summary'}
                     >
-                      {aiLoading === 'summary' ? 'กำลังสรุปด้วย Gemini...' : 'Generate AI Summary'}
+                      {aiLoading === 'summary' ? 'กำลังสรุปด้วย Gemini...' : 'สรุปนาทีและคำพูด'}
                     </button>
                   </div>
 

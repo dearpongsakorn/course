@@ -1,5 +1,6 @@
 import { Link } from 'react-router-dom'
-import { ArrowRight, Clock3, Star, Users } from 'lucide-react'
+import { ArrowRight, Clock3, CreditCard, ShoppingCart, Star, Users } from 'lucide-react'
+import { cartStorage } from '../services/api'
 import type { Course } from '../types/course'
 
 interface CourseCardProps {
@@ -7,8 +8,10 @@ interface CourseCardProps {
   progress?: number
   ctaLabel?: string
   ctaTo?: string
+  cardTo?: string
   showDescription?: boolean
   showActions?: boolean
+  showCartAction?: boolean
 }
 
 const formatPrice = (price: number) =>
@@ -23,12 +26,19 @@ export default function CourseCard({
   progress,
   ctaLabel = 'ดูรายละเอียด',
   ctaTo,
+  cardTo,
   showDescription = true,
   showActions = true,
+  showCartAction = false,
 }: CourseCardProps) {
+  const primaryLink = cardTo ?? ctaTo ?? `/courses/${course.slug}`
+  const addToCart = () => {
+    cartStorage.addItem(course.slug)
+  }
+
   return (
     <article className="card flex h-full flex-col overflow-hidden">
-      <Link to={`/courses/${course.slug}`} className="block overflow-hidden">
+      <Link to={primaryLink} className="block overflow-hidden">
         <img
           src={course.coverImage}
           alt={course.title}
@@ -80,12 +90,24 @@ export default function CourseCard({
         )}
 
         {showActions ? (
-          <div className="mt-5 flex items-center justify-between border-t border-slate-200 pt-4">
-            <p className="text-base font-semibold text-slate-950">{formatPrice(course.price)}</p>
-            <Link to={ctaTo ?? `/courses/${course.slug}`} className="btn-secondary px-3 py-2">
-              {ctaLabel}
-              <ArrowRight size={15} />
-            </Link>
+          <div className="mt-5 border-t border-slate-200 pt-4">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-base font-semibold text-slate-950">{formatPrice(course.price)}</p>
+              <Link to={ctaTo ?? `/courses/${course.slug}`} className="btn-secondary px-3 py-2">
+                {ctaLabel}
+                {showCartAction ? <CreditCard size={15} className="text-emerald-600" /> : <ArrowRight size={15} />}
+              </Link>
+            </div>
+            {showCartAction ? (
+              <button
+                type="button"
+                className="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800 transition hover:bg-amber-100"
+                onClick={addToCart}
+              >
+                <ShoppingCart size={16} className="text-amber-600" />
+                เพิ่มตะกร้า
+              </button>
+            ) : null}
           </div>
         ) : null}
       </div>

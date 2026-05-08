@@ -1,14 +1,5 @@
 import { Link, useLocation } from 'react-router-dom'
-import {
-  BarChart3,
-  BookOpenCheck,
-  GraduationCap,
-  Library,
-  Settings,
-  ShieldCheck,
-  UserRound,
-  Users,
-} from 'lucide-react'
+import { BarChart3, BookOpenCheck, Library, ShieldCheck, UserRound, Users } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import type { User, UserRole } from '../types/user'
 
@@ -25,12 +16,12 @@ const itemsByRole: Record<Extract<UserRole, 'student' | 'teacher' | 'admin'>, Si
   ],
   teacher: [
     { to: '/teacher', label: 'จัดการคอร์ส', icon: Library },
-    { to: '/teacher', label: 'Preview บทเรียน', icon: GraduationCap },
+    { to: '/teacher?section=profile', label: 'โปรไฟล์', icon: UserRound },
   ],
   admin: [
-    { to: '/admin', label: 'ภาพรวมระบบ', icon: BarChart3 },
-    { to: '/teacher', label: 'คอร์สทั้งหมด', icon: Library },
-    { to: '/student', label: 'ผู้เรียน', icon: Users },
+    { to: '/admin', label: 'แดชบอร์ดระบบ', icon: BarChart3 },
+    { to: '/admin?section=users', label: 'จัดการผู้ใช้', icon: Users },
+    { to: '/admin?section=courses', label: 'จัดการคอร์ส', icon: Library },
   ],
 }
 
@@ -88,13 +79,6 @@ export default function Sidebar({
           )
         })}
       </nav>
-
-      <div className="border-t border-slate-200 p-4">
-        <button type="button" className="btn-secondary w-full">
-          <Settings size={16} />
-          ตั้งค่า
-        </button>
-      </div>
     </aside>
   )
 }

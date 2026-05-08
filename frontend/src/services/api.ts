@@ -36,6 +36,7 @@ export interface StudentProfile {
 
 export interface TeacherDashboardData {
   user: User
+  profile?: StudentProfile
   courses: Course[]
 }
 
@@ -47,6 +48,7 @@ export interface AdminDashboardData {
     totalCourses: number
     totalTeachers: number
     totalStudents: number
+    activeUsers: number
   }
 }
 
@@ -67,6 +69,14 @@ export interface CreateCoursePayload {
 }
 
 export type UpdateCoursePayload = CreateCoursePayload
+
+export interface LessonPayload {
+  title: string
+  duration: string
+  summary: string
+  preview: boolean
+  videoUrl?: string
+}
 
 export interface EnrollCourseResponse {
   courseSlug: string
@@ -119,6 +129,8 @@ export interface AiQuizResponse {
 
 const authStorageKey = 'learnos_auth'
 const authChangeEvent = 'learnos-auth-change'
+const cartStorageKey = 'learnos_cart'
+const cartChangeEvent = 'learnos-cart-change'
 
 export const authStorage = {
   getSession: (): AuthSession | null => {
@@ -139,6 +151,41 @@ export const authStorage = {
 
     return () => {
       window.removeEventListener(authChangeEvent, listener)
+      window.removeEventListener('storage', listener)
+    }
+  },
+}
+
+export const cartStorage = {
+  getItems: (): string[] => {
+    const raw = localStorage.getItem(cartStorageKey)
+    if (!raw) return []
+
+    try {
+      const items = JSON.parse(raw)
+      return Array.isArray(items) ? items.filter((item): item is string => typeof item === 'string') : []
+    } catch {
+      return []
+    }
+  },
+  addItem: (courseSlug: string) => {
+    const nextItems = Array.from(new Set([...cartStorage.getItems(), courseSlug]))
+    localStorage.setItem(cartStorageKey, JSON.stringify(nextItems))
+    window.dispatchEvent(new Event(cartChangeEvent))
+    return nextItems
+  },
+  removeItem: (courseSlug: string) => {
+    const nextItems = cartStorage.getItems().filter((item) => item !== courseSlug)
+    localStorage.setItem(cartStorageKey, JSON.stringify(nextItems))
+    window.dispatchEvent(new Event(cartChangeEvent))
+    return nextItems
+  },
+  subscribe: (listener: () => void) => {
+    window.addEventListener(cartChangeEvent, listener)
+    window.addEventListener('storage', listener)
+
+    return () => {
+      window.removeEventListener(cartChangeEvent, listener)
       window.removeEventListener('storage', listener)
     }
   },
@@ -248,8 +295,22 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+  updateCourseStatus: (slug: string, status: Course['status']) =>
+    request<Course>(`/api/courses/${slug}/status`, {
+      method: 'POST',
+      body: JSON.stringify({ status }),
+    }),
   deleteCourse: (slug: string) =>
     request<{ ok: boolean; slug: string }>(`/api/courses/${slug}/delete`, {
+      method: 'POST',
+    }),
+  saveLesson: (slug: string, lessonId: string | null, payload: LessonPayload) =>
+    request<Course>(`/api/courses/${slug}/lessons${lessonId ? `/${lessonId}` : ''}`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  deleteLesson: (slug: string, lessonId: string) =>
+    request<Course>(`/api/courses/${slug}/lessons/${lessonId}/delete`, {
       method: 'POST',
     }),
   getStudentDashboard: () => request<StudentDashboardData>('/api/student/dashboard'),
@@ -259,5 +320,10 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   getTeacherDashboard: () => request<TeacherDashboardData>('/api/teacher/dashboard'),
+  updateTeacherProfile: (payload: Omit<StudentProfile, 'updatedAt'>) =>
+    request<StudentProfile>('/api/teacher/profile', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
   getAdminDashboard: () => request<AdminDashboardData>('/api/admin/dashboard'),
 }

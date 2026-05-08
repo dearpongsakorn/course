@@ -35,7 +35,7 @@ export default function Register() {
         title: role === 'teacher' ? String(formData.get('title')) : undefined,
       })
       authStorage.setSession(session)
-      navigate(session.dashboardPath)
+      navigate(role === 'student' ? '/courses' : session.dashboardPath)
     } catch (currentError) {
       setError(currentError instanceof Error ? currentError.message : 'สมัครสมาชิกไม่สำเร็จ')
     } finally {
