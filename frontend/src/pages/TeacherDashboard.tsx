@@ -2,15 +2,20 @@ import { useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
   AlertTriangle,
+  BookOpen,
   Camera,
+  CircleDollarSign,
   Edit3,
   Eye,
   EyeOff,
   ImagePlus,
+  LibraryBig,
   LoaderCircle,
   Plus,
+  Search,
   Trash2,
   UserRound,
+  UsersRound,
   Video,
   X,
 } from 'lucide-react'
@@ -50,6 +55,133 @@ const emptyLessonDraft: LessonDraft = {
   preview: true,
   videoUrl: '',
 }
+const maxVideoUploadBytes = 1024 * 1024 * 1024
+
+const formatVideoDuration = (durationSeconds: number) => {
+  const totalSeconds = Math.max(0, Math.round(durationSeconds))
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  const paddedSeconds = String(seconds).padStart(2, '0')
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${paddedSeconds}`
+  }
+
+  return `${String(minutes).padStart(2, '0')}:${paddedSeconds}`
+}
+
+const readVideoDuration = (file: File) =>
+  new Promise<string>((resolve, reject) => {
+    const video = document.createElement('video')
+    const objectUrl = URL.createObjectURL(file)
+    let settled = false
+    let timeoutId: number | undefined
+
+    const cleanup = () => {
+      if (timeoutId) window.clearTimeout(timeoutId)
+      URL.revokeObjectURL(objectUrl)
+      video.removeAttribute('src')
+      video.load()
+    }
+
+    const settle = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      callback()
+      cleanup()
+    }
+
+    const resolveIfReady = () => {
+      if (Number.isFinite(video.duration) && video.duration > 0) {
+        settle(() => resolve(formatVideoDuration(video.duration)))
+        return true
+      }
+
+      return false
+    }
+
+    video.preload = 'metadata'
+    video.onloadedmetadata = () => {
+      if (resolveIfReady()) return
+
+      try {
+        video.currentTime = Number.MAX_SAFE_INTEGER
+      } catch {
+        settle(() => reject(new Error('ไม่สามารถอ่านความยาววิดีโอได้')))
+      }
+    }
+    video.ondurationchange = resolveIfReady
+    video.onseeked = resolveIfReady
+    video.onerror = () => {
+      settle(() => reject(new Error('ไม่สามารถอ่านความยาววิดีโอได้')))
+    }
+    timeoutId = window.setTimeout(() => {
+      settle(() => reject(new Error('อ่านความยาววิดีโอไม่ทันเวลา')))
+    }, 12000)
+    video.src = objectUrl
+  })
+
+const createVideoPoster = (file: File) =>
+  new Promise<string>((resolve, reject) => {
+    const video = document.createElement('video')
+    const canvas = document.createElement('canvas')
+    const objectUrl = URL.createObjectURL(file)
+    let settled = false
+    let timeoutId: number | undefined
+
+    const cleanup = () => {
+      if (timeoutId) window.clearTimeout(timeoutId)
+      URL.revokeObjectURL(objectUrl)
+      video.removeAttribute('src')
+      video.load()
+    }
+
+    const settle = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      callback()
+      cleanup()
+    }
+
+    const capture = () => {
+      const width = video.videoWidth
+      const height = video.videoHeight
+
+      if (!width || !height) {
+        settle(() => reject(new Error('ไม่สามารถสร้างภาพตัวอย่างวิดีโอได้')))
+        return
+      }
+
+      canvas.width = width
+      canvas.height = height
+      canvas.getContext('2d')?.drawImage(video, 0, 0, width, height)
+      settle(() => resolve(canvas.toDataURL('image/jpeg', 0.84)))
+    }
+
+    video.muted = true
+    video.playsInline = true
+    video.preload = 'auto'
+    video.onloadedmetadata = () => {
+      const duration = Number.isFinite(video.duration) ? video.duration : 0
+      const targetTime = duration > 2 ? Math.min(Math.max(duration * 0.15, 1), duration - 0.2) : 0
+
+      if (targetTime > 0) {
+        video.currentTime = targetTime
+      } else {
+        capture()
+      }
+    }
+    video.onseeked = capture
+    video.onloadeddata = () => {
+      if (!Number.isFinite(video.duration) || video.duration <= 2) capture()
+    }
+    video.onerror = () => settle(() => reject(new Error('ไม่สามารถสร้างภาพตัวอย่างวิดีโอได้')))
+    timeoutId = window.setTimeout(() => {
+      settle(() => reject(new Error('สร้างภาพตัวอย่างวิดีโอไม่ทันเวลา')))
+    }, 12000)
+    video.src = objectUrl
+  })
 
 const draftFromLesson = (lesson: Lesson): LessonDraft => ({
   title: lesson.title,
@@ -108,6 +240,7 @@ function CourseFormModal({
   coverFile,
   formMessage,
   saving,
+  coverUploadProgress,
   onClose,
   onSubmit,
   onDraftChange,
@@ -119,16 +252,17 @@ function CourseFormModal({
   coverFile: File | null
   formMessage: { tone: 'success' | 'error'; text: string } | null
   saving: boolean
+  coverUploadProgress: number | null
   onClose: () => void
   onSubmit: (event: React.FormEvent<HTMLFormElement>) => void
   onDraftChange: <K extends keyof CourseDraft>(key: K, value: CourseDraft[K]) => void
   onCoverChange: (event: React.ChangeEvent<HTMLInputElement>) => void
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-950/55 px-4 py-8">
-      <div className="w-full max-w-5xl rounded-lg border border-slate-200 bg-white shadow-2xl">
-        <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4 sm:px-6">
-          <div>
+    <div className="fixed inset-0 z-50 flex items-stretch justify-center bg-slate-950/60 p-0 sm:p-4 lg:p-6">
+      <div className="flex h-full w-full max-w-[1500px] flex-col overflow-hidden rounded-none border border-slate-200 bg-white shadow-2xl sm:h-[calc(100vh-2rem)] sm:rounded-lg lg:h-[calc(100vh-3rem)]">
+        <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3 sm:px-6">
+          <div className="min-w-0">
             <h2 className="text-lg font-semibold text-slate-950">
               {mode === 'create' ? 'สร้างคอร์สใหม่' : 'แก้ไขคอร์ส'}
             </h2>
@@ -143,7 +277,7 @@ function CourseFormModal({
           </button>
         </div>
 
-        <form className="p-5 sm:p-6" onSubmit={onSubmit}>
+        <form className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-5 xl:p-7" onSubmit={onSubmit}>
           {formMessage ? (
             <div
               className={`mb-4 rounded-lg border px-4 py-3 text-sm ${
@@ -155,7 +289,8 @@ function CourseFormModal({
               {formMessage.text}
             </div>
           ) : null}
-          <div className="grid gap-4 sm:grid-cols-2">
+          <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_360px] xl:grid-cols-[minmax(0,1fr)_420px] lg:items-start">
+            <div className="grid gap-3 sm:grid-cols-2">
             <label className="block sm:col-span-2">
               <span className="field-label">ชื่อคอร์ส</span>
               <input
@@ -170,7 +305,7 @@ function CourseFormModal({
             <label className="block sm:col-span-2">
               <span className="field-label">รายละเอียดคอร์ส</span>
               <textarea
-                className="field-input min-h-28 resize-y"
+                className="field-input min-h-20 resize-y"
                 required
                 placeholder="อธิบายภาพรวม สิ่งที่ผู้เรียนจะได้ และผลลัพธ์หลังเรียนจบ"
                 value={draft.description}
@@ -230,15 +365,17 @@ function CourseFormModal({
             <label className="block sm:col-span-2">
               <span className="field-label">ผลลัพธ์การเรียนรู้</span>
               <textarea
-                className="field-input min-h-24 resize-y"
+                className="field-input min-h-20 resize-y"
                 placeholder="ใส่ 1 หัวข้อต่อ 1 บรรทัด"
                 value={draft.outcomes}
                 onChange={(event) => onDraftChange('outcomes', event.target.value)}
               />
             </label>
 
-            <div className="sm:col-span-2 grid gap-4">
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
+            </div>
+
+            <div className="grid gap-3">
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
                 <div className="flex items-center gap-2 text-sm font-medium text-slate-950">
                   <ImagePlus size={16} />
                   รูปปกคอร์ส
@@ -246,9 +383,9 @@ function CourseFormModal({
                 <img
                   src={coverPreview}
                   alt="Course cover preview"
-                  className="mt-4 aspect-video w-full rounded-md border border-slate-200 object-cover"
+                  className="mt-3 aspect-video w-full rounded-md border border-slate-200 object-cover"
                 />
-                <div className="mt-4 space-y-3">
+                <div className="mt-3 space-y-3">
                   <label className="block">
                     <span className="field-label">อัปโหลดรูปปก</span>
                     <input
@@ -256,6 +393,7 @@ function CourseFormModal({
                       accept="image/png,image/jpeg,image/webp"
                       className="field-input file:mr-3 file:rounded-md file:border-0 file:bg-slate-950 file:px-3 file:py-2 file:text-sm file:font-medium file:text-white"
                       onChange={onCoverChange}
+                      disabled={saving}
                     />
                   </label>
                   <label className="block">
@@ -268,17 +406,29 @@ function CourseFormModal({
                     />
                   </label>
                   {coverFile ? <p className="text-xs text-slate-500">{coverFile.name}</p> : null}
+                  {coverUploadProgress !== null ? (
+                    <div className="rounded-md border border-slate-200 bg-white p-3">
+                      <div className="flex items-center justify-between gap-3 text-xs font-medium text-slate-600">
+                        <span>กำลังอัปโหลดรูปปก</span>
+                        <span>{coverUploadProgress}%</span>
+                      </div>
+                      <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-200">
+                        <span
+                          className="block h-full rounded-full bg-slate-950 transition-all"
+                          style={{ width: `${coverUploadProgress}%` }}
+                        />
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
               </div>
 
 
             </div>
-
-
           </div>
 
-          <div className="mt-6 flex items-center justify-end gap-3 border-t border-slate-200 pt-5">
-            <button type="button" className="btn-secondary" onClick={onClose}>
+          <div className="sticky bottom-0 -mx-4 mt-4 flex items-center justify-end gap-3 border-t border-slate-200 bg-white/95 px-4 py-4 backdrop-blur sm:-mx-5 sm:px-5 xl:-mx-7 xl:px-7">
+            <button type="button" className="btn-secondary" onClick={onClose} disabled={saving}>
               ยกเลิก
             </button>
             <button type="submit" className="btn-primary" disabled={saving}>
@@ -330,14 +480,27 @@ function DeleteModal({
               คอร์ส <span className="font-medium text-slate-950">{course.title}</span> จะถูกลบออกจากระบบ
               พร้อมบทเรียนและข้อมูลที่ผูกกับคอร์สนี้
             </p>
+            <p className="mt-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm font-medium text-rose-700">
+              การลบนี้ย้อนกลับไม่ได้
+            </p>
           </div>
         </div>
         <div className="mt-6 flex items-center justify-end gap-3">
-          <button type="button" className="btn-secondary" onClick={onCancel}>
+          <button type="button" className="btn-secondary" onClick={onCancel} disabled={deleting}>
             ยกเลิก
           </button>
           <button type="button" className="btn-primary bg-rose-700 hover:bg-rose-800" onClick={onConfirm} disabled={deleting}>
-            {deleting ? 'กำลังลบ...' : 'ยืนยันการลบ'}
+            {deleting ? (
+              <>
+                <LoaderCircle size={16} className="animate-spin" />
+                กำลังลบ...
+              </>
+            ) : (
+              <>
+                <Trash2 size={16} />
+                ลบคอร์ส
+              </>
+            )}
           </button>
         </div>
       </div>
@@ -351,6 +514,9 @@ function LessonManagerModal({
   editingLessonId,
   saving,
   uploading,
+  uploadProgress,
+  videoPreviewUrl,
+  videoPosterUrl,
   message,
   onClose,
   onNew,
@@ -365,6 +531,9 @@ function LessonManagerModal({
   editingLessonId: string | null
   saving: boolean
   uploading: boolean
+  uploadProgress: number | null
+  videoPreviewUrl: string | null
+  videoPosterUrl: string | null
   message: { tone: 'success' | 'error'; text: string } | null
   onClose: () => void
   onNew: () => void
@@ -374,58 +543,71 @@ function LessonManagerModal({
   onSubmit: (event: React.FormEvent<HTMLFormElement>) => void
   onDelete: (lessonId: string) => void
 }) {
+  const videoPreviewSrc = videoPreviewUrl || draft.videoUrl
+  const [videoPreviewError, setVideoPreviewError] = useState(false)
+
+  useEffect(() => {
+    setVideoPreviewError(false)
+  }, [videoPreviewSrc])
+
+  const showFirstVideoFrame = (event: React.SyntheticEvent<HTMLVideoElement>) => {
+    const video = event.currentTarget
+    setVideoPreviewError(false)
+
+    if (videoPosterUrl) return
+
+    if (video.duration > 0.2 && video.currentTime < 0.05) {
+      video.currentTime = 0.1
+    }
+  }
+
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-950/55 px-4 py-8">
-      <div className="w-full max-w-6xl rounded-lg border border-slate-200 bg-white shadow-2xl">
+    <div className="fixed inset-0 z-50 flex items-stretch justify-center bg-slate-950/60 p-0 sm:p-4 lg:p-6">
+      <div className="flex h-full w-full flex-col overflow-hidden rounded-none border border-slate-200 bg-white shadow-2xl sm:h-[calc(100vh-2rem)] sm:rounded-lg lg:h-[calc(100vh-3rem)]">
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4 sm:px-6">
           <div>
             <h2 className="text-lg font-semibold text-slate-950">จัดการบทเรียน</h2>
-            <p className="mt-1 text-sm text-slate-500">{course.title}</p>
+            <p className="mt-1 text-sm text-slate-500">
+              {course.title} · {editingLessonId ? 'แก้ไขบทเรียน' : 'เพิ่มบทเรียนใหม่'}
+            </p>
           </div>
-          <button type="button" className="btn-ghost" onClick={onClose} aria-label="ปิด popup">
-            <X size={18} />
-          </button>
+          <div className="flex items-center gap-2">
+            <button type="button" className="btn-secondary" onClick={onNew}>
+              <Plus size={16} />
+              บทเรียนใหม่
+            </button>
+            <button type="button" className="btn-ghost" onClick={onClose} aria-label="ปิด popup">
+              <X size={18} />
+            </button>
+          </div>
         </div>
 
-        <div className="grid gap-0 lg:grid-cols-[320px_minmax(0,1fr)]">
-          <aside className="border-b border-slate-200 bg-slate-50 p-5 lg:border-b-0 lg:border-r">
-            <button type="button" className="btn-primary w-full" onClick={onNew}>
-              <Plus size={16} />
-              เพิ่มบทเรียน
-            </button>
-            <div className="mt-4 space-y-2">
-              {course.lessons.length ? (
-                course.lessons.map((lesson, index) => (
-                  <button
-                    key={lesson.id}
-                    type="button"
-                    className={[
-                      'w-full rounded-md border px-3 py-3 text-left transition',
-                      editingLessonId === lesson.id
-                        ? 'border-slate-950 bg-white text-slate-950 shadow-sm'
-                        : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300',
-                    ].join(' ')}
-                    onClick={() => onSelect(lesson)}
-                  >
-                    <p className="text-sm font-semibold">
-                      {index + 1}. {lesson.title}
-                    </p>
-                    <div className="mt-2 flex flex-wrap gap-2 text-xs text-slate-500">
-                      <span>{lesson.duration || '00:00'}</span>
-                      {lesson.preview ? <span>Preview</span> : null}
-                      {lesson.videoUrl ? <span>มีวิดีโอ</span> : null}
-                    </div>
-                  </button>
-                ))
-              ) : (
-                <p className="rounded-md border border-dashed border-slate-300 bg-white p-4 text-sm text-slate-500">
-                  ยังไม่มีบทเรียน
-                </p>
-              )}
+        {course.lessons.length ? (
+          <div className="border-b border-slate-200 bg-slate-50 px-5 py-3 sm:px-6">
+            <div className="flex gap-2 overflow-x-auto pb-1">
+              {course.lessons.map((lesson, index) => (
+                <button
+                  key={lesson.id}
+                  type="button"
+                  className={[
+                    'flex min-w-max items-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition',
+                    editingLessonId === lesson.id
+                      ? 'border-slate-950 bg-white text-slate-950 shadow-sm'
+                      : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300 hover:text-slate-950',
+                  ].join(' ')}
+                  onClick={() => onSelect(lesson)}
+                >
+                  <span>{index + 1}. {lesson.title || 'ไม่มีชื่อบทเรียน'}</span>
+                  {lesson.preview ? <span className="text-xs text-slate-400">Preview</span> : null}
+                  {lesson.videoUrl ? <span className="text-xs text-slate-400">มีวิดีโอ</span> : null}
+                </button>
+              ))}
             </div>
-          </aside>
+          </div>
+        ) : null}
 
-          <form className="space-y-4 p-5 sm:p-6" onSubmit={onSubmit}>
+        <div className="min-h-0 flex-1">
+          <form className="min-h-0 h-full overflow-y-auto p-5 sm:p-6 xl:p-8" onSubmit={onSubmit}>
             {message ? (
               <div
                 className={`rounded-lg border px-4 py-3 text-sm ${
@@ -438,7 +620,7 @@ function LessonManagerModal({
               </div>
             ) : null}
 
-            <div className="grid gap-4 sm:grid-cols-2">
+            <div className="mt-4 grid gap-5 sm:grid-cols-2 xl:grid-cols-[minmax(0,0.95fr)_minmax(480px,1.05fr)]">
               <label className="block sm:col-span-2">
                 <span className="field-label">ชื่อบทเรียน</span>
                 <input
@@ -450,7 +632,7 @@ function LessonManagerModal({
                 />
               </label>
 
-              <label className="block">
+              <label className="block xl:col-start-1">
                 <span className="field-label">ความยาววิดีโอ</span>
                 <input
                   className="field-input"
@@ -460,8 +642,11 @@ function LessonManagerModal({
                 />
               </label>
 
-              <label className="block">
-                <span className="field-label">อัปโหลดวิดีโอ MP4</span>
+              <label className="block xl:col-start-2 xl:row-span-2">
+                <span className="field-label">อัปโหลดวิดีโอหลัก MP4</span>
+                <p className="mt-1 text-xs leading-5 text-slate-500">
+                  ไฟล์นี้คือวิดีโอเต็มของบทเรียน ถ้าเปิดตัวอย่างก่อนซื้อ ผู้เรียนที่ยังไม่สมัครจะดูไฟล์นี้ได้ด้วย
+                </p>
                 <input
                   type="file"
                   accept="video/mp4,.mp4"
@@ -469,21 +654,54 @@ function LessonManagerModal({
                   onChange={onVideoChange}
                   disabled={uploading}
                 />
+                {uploading ? (
+                  <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-3">
+                    <div className="flex items-center justify-between gap-3 text-xs font-medium text-slate-600">
+                      <span>กำลังอัปโหลดวิดีโอ</span>
+                      <span>{uploadProgress ?? 0}%</span>
+                    </div>
+                    <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-200">
+                      <span
+                        className="block h-full rounded-full bg-slate-950 transition-all"
+                        style={{ width: `${uploadProgress ?? 0}%` }}
+                      />
+                    </div>
+                  </div>
+                ) : null}
               </label>
 
-              <label className="block sm:col-span-2">
+              <label className="block xl:col-start-1">
                 <span className="field-label">สรุปบทเรียน</span>
                 <textarea
-                  className="field-input min-h-28 resize-y"
+                  className="field-input min-h-40 resize-y"
                   value={draft.summary}
                   onChange={(event) => onDraftChange('summary', event.target.value)}
                   placeholder="เขียนสรุปสั้น ๆ ของบทเรียน"
                 />
               </label>
 
-              {draft.videoUrl ? (
-                <div className="sm:col-span-2 overflow-hidden rounded-md border border-slate-200 bg-slate-950">
-                  <video className="aspect-video w-full bg-slate-950 object-contain" controls playsInline src={draft.videoUrl} />
+              {videoPreviewSrc ? (
+                <div className="overflow-hidden rounded-md border border-slate-200 bg-slate-950 sm:col-span-2">
+                  <video
+                    className="aspect-video max-h-[52vh] w-full bg-slate-950 object-contain"
+                    controls
+                    playsInline
+                    preload="auto"
+                    poster={videoPosterUrl ?? undefined}
+                    src={videoPreviewSrc}
+                    onError={() => setVideoPreviewError(true)}
+                    onLoadedMetadata={showFirstVideoFrame}
+                    onLoadedData={() => setVideoPreviewError(false)}
+                  />
+                  {videoPreviewError ? (
+                    <p className="border-t border-rose-400/20 bg-rose-950/40 px-4 py-2 text-xs text-rose-100">
+                      แสดงตัวอย่างวิดีโอไม่ได้ อาจเกิดจาก codec ที่ browser ไม่รองรับ หรือ URL วิดีโอยังเข้าถึงไม่ได้
+                    </p>
+                  ) : videoPreviewUrl ? (
+                    <p className="border-t border-white/10 px-4 py-2 text-xs text-slate-300">
+                      กำลังแสดงตัวอย่างจากไฟล์ในเครื่อง หลังบันทึกแล้วระบบจะใช้ URL วิดีโอที่อัปโหลด
+                    </p>
+                  ) : null}
                 </div>
               ) : null}
 
@@ -494,7 +712,12 @@ function LessonManagerModal({
                   onChange={(event) => onDraftChange('preview', event.target.checked)}
                   className="h-4 w-4 rounded border-slate-300"
                 />
-                เปิดให้บทเรียนนี้เป็นตัวอย่างก่อนซื้อ
+                <span>
+                  <span className="block font-medium text-slate-800">เปิดให้บทเรียนนี้เป็นวิดีโอตัวอย่างก่อนซื้อ</span>
+                  <span className="mt-0.5 block text-xs text-slate-500">
+                    ตอนนี้ระบบใช้วิดีโอหลักไฟล์เดียวกันเป็น preview ถ้าต้องการคลิปตัวอย่างแยก ต้องเพิ่มช่องไฟล์และฐานข้อมูลอีกชุด
+                  </span>
+                </span>
               </label>
             </div>
 
@@ -538,6 +761,8 @@ export default function TeacherDashboard() {
   const activeSection = searchParams.get('section') === 'profile' ? 'profile' : 'courses'
   const { data, error, loading } = useApi(() => api.getTeacherDashboard(), [])
   const [courses, setCourses] = useState<Course[]>([])
+  const [courseSearch, setCourseSearch] = useState('')
+  const [statusFilter, setStatusFilter] = useState<'all' | Course['status']>('all')
   const [teacherProfile, setTeacherProfile] = useState<StudentProfile | null>(null)
   const [profileDraft, setProfileDraft] = useState<TeacherProfileDraft>(emptyTeacherProfile)
   const [profileError, setProfileError] = useState<string | null>(null)
@@ -556,9 +781,13 @@ export default function TeacherDashboard() {
   const [lessonMessage, setLessonMessage] = useState<{ tone: 'success' | 'error'; text: string } | null>(null)
   const [savingLesson, setSavingLesson] = useState(false)
   const [uploadingLessonVideo, setUploadingLessonVideo] = useState(false)
+  const [lessonUploadProgress, setLessonUploadProgress] = useState<number | null>(null)
+  const [lessonVideoPreviewUrl, setLessonVideoPreviewUrl] = useState<string | null>(null)
+  const [lessonVideoPosterUrl, setLessonVideoPosterUrl] = useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<Course | null>(null)
   const [coverFile, setCoverFile] = useState<File | null>(null)
   const [coverPreview, setCoverPreview] = useState<string>(defaultCover)
+  const [coverUploadProgress, setCoverUploadProgress] = useState<number | null>(null)
   const [draft, setDraft] = useState<CourseDraft>(() => createEmptyDraft())
 
   useEffect(() => {
@@ -606,11 +835,50 @@ export default function TeacherDashboard() {
     () => courses.find((course) => course.slug === editingSlug) ?? null,
     [courses, editingSlug],
   )
+  const teacherStats = useMemo(() => {
+    const published = courses.filter((course) => (course.status ?? 'published') === 'published').length
+    const draft = courses.filter((course) => (course.status ?? 'published') === 'draft').length
+    const totalStudents = courses.reduce((total, course) => total + course.students, 0)
+    const totalLessons = courses.reduce((total, course) => total + (course.lessonCount ?? course.lessons.length), 0)
+    const totalRevenue = courses.reduce((total, course) => total + course.price * course.students, 0)
+
+    return {
+      totalCourses: courses.length,
+      published,
+      draft,
+      totalStudents,
+      totalLessons,
+      totalRevenue,
+    }
+  }, [courses])
+  const filteredCourses = useMemo(() => {
+    const normalizedSearch = courseSearch.trim().toLowerCase()
+
+    return courses.filter((course) => {
+      const courseStatus = course.status ?? 'published'
+      const matchesStatus = statusFilter === 'all' || courseStatus === statusFilter
+      const matchesSearch =
+        !normalizedSearch ||
+        course.title.toLowerCase().includes(normalizedSearch) ||
+        course.category.toLowerCase().includes(normalizedSearch)
+
+      return matchesStatus && matchesSearch
+    })
+  }, [courseSearch, courses, statusFilter])
   const resetDraft = () => {
     setDraft(createEmptyDraft())
     setCoverFile(null)
     setCoverPreview(defaultCover)
+    setCoverUploadProgress(null)
     setEditingSlug(null)
+  }
+
+  const clearLessonVideoPreview = () => {
+    setLessonVideoPreviewUrl((current) => {
+      if (current) URL.revokeObjectURL(current)
+      return null
+    })
+    setLessonVideoPosterUrl(null)
   }
 
   const closeFormModal = () => {
@@ -631,6 +899,7 @@ export default function TeacherDashboard() {
     setDraft(draftFromCourse(course))
     setCoverFile(null)
     setCoverPreview(course.coverImage)
+    setCoverUploadProgress(null)
     setFormOpen(true)
     setMessage(null)
   }
@@ -648,18 +917,24 @@ export default function TeacherDashboard() {
     setLessonDraft(emptyLessonDraft)
     setLessonMessage(null)
     setUploadingLessonVideo(false)
+    setLessonUploadProgress(null)
+    clearLessonVideoPreview()
   }
 
   const startNewLesson = () => {
     setEditingLessonId(null)
     setLessonDraft(emptyLessonDraft)
     setLessonMessage(null)
+    setLessonUploadProgress(null)
+    clearLessonVideoPreview()
   }
 
   const selectLesson = (lesson: Lesson) => {
     setEditingLessonId(lesson.id)
     setLessonDraft(draftFromLesson(lesson))
     setLessonMessage(null)
+    setLessonUploadProgress(null)
+    clearLessonVideoPreview()
   }
 
   const handleLessonDraftChange = <K extends keyof LessonDraft>(key: K, value: LessonDraft[K]) => {
@@ -696,12 +971,49 @@ export default function TeacherDashboard() {
 
     if (!file) return
 
+    if (file.size > maxVideoUploadBytes) {
+      setLessonMessage({
+        tone: 'error',
+        text: 'วิดีโอต้องไม่เกิน 1GB',
+      })
+      event.target.value = ''
+      return
+    }
+
+    const previewUrl = URL.createObjectURL(file)
+    setLessonVideoPreviewUrl((current) => {
+      if (current) URL.revokeObjectURL(current)
+      return previewUrl
+    })
+    setLessonVideoPosterUrl(null)
+
+    createVideoPoster(file)
+      .then((posterUrl) => setLessonVideoPosterUrl(posterUrl))
+      .catch(() => undefined)
+
+    readVideoDuration(file)
+      .then((duration) => {
+        setLessonDraft((current) => ({ ...current, duration }))
+      })
+      .catch(() => {
+        // Some browser/codecs may not expose metadata before upload; the teacher can still edit the field manually.
+      })
+
     setUploadingLessonVideo(true)
+    setLessonUploadProgress(0)
     setLessonMessage(null)
 
     try {
-      const uploaded = await api.uploadAsset({ kind: 'video', file })
+      const uploaded = await api.uploadVideoAsset({ file, onProgress: setLessonUploadProgress })
       setLessonDraft((current) => ({ ...current, videoUrl: uploaded.fileUrl }))
+      setLessonVideoPreviewUrl((current) => {
+        if (current) URL.revokeObjectURL(current)
+        return null
+      })
+      setLessonMessage({
+        tone: 'success',
+        text: uploaded.storage === 'r2' ? 'อัปโหลดวิดีโอไป Cloudflare R2 สำเร็จ' : 'อัปโหลดวิดีโอสำเร็จ',
+      })
     } catch (currentError) {
       setLessonMessage({
         tone: 'error',
@@ -709,6 +1021,8 @@ export default function TeacherDashboard() {
       })
     } finally {
       setUploadingLessonVideo(false)
+      setLessonUploadProgress(null)
+      event.target.value = ''
     }
   }
 
@@ -833,7 +1147,8 @@ export default function TeacherDashboard() {
       let coverImage = draft.coverImageUrl.trim() || editingCourse?.coverImage || defaultCover
 
       if (coverFile) {
-        const uploadedCover = await api.uploadAsset({ kind: 'cover', file: coverFile })
+        setCoverUploadProgress(0)
+        const uploadedCover = await api.uploadAsset({ kind: 'cover', file: coverFile, onProgress: setCoverUploadProgress })
         coverImage = uploadedCover.fileUrl
       }
 
@@ -876,6 +1191,7 @@ export default function TeacherDashboard() {
       })
     } finally {
       setSaving(false)
+      setCoverUploadProgress(null)
     }
   }
 
@@ -1061,12 +1377,99 @@ export default function TeacherDashboard() {
           </section>
         ) : null}
 
+        <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+          {[
+            {
+              label: 'คอร์สทั้งหมด',
+              value: teacherStats.totalCourses,
+              icon: LibraryBig,
+              accentClass: 'bg-sky-50 text-sky-700 ring-sky-100 dark:bg-sky-400/10 dark:text-sky-200 dark:ring-sky-400/15',
+            },
+            {
+              label: 'เผยแพร่แล้ว',
+              value: teacherStats.published,
+              icon: Eye,
+              accentClass:
+                'bg-emerald-50 text-emerald-700 ring-emerald-100 dark:bg-emerald-400/10 dark:text-emerald-200 dark:ring-emerald-400/15',
+            },
+            {
+              label: 'ผู้เรียนรวม',
+              value: teacherStats.totalStudents.toLocaleString('th-TH'),
+              icon: UsersRound,
+              accentClass:
+                'bg-violet-50 text-violet-700 ring-violet-100 dark:bg-violet-400/10 dark:text-violet-200 dark:ring-violet-400/15',
+            },
+            {
+              label: 'บทเรียนรวม',
+              value: teacherStats.totalLessons,
+              icon: BookOpen,
+              accentClass:
+                'bg-amber-50 text-amber-700 ring-amber-100 dark:bg-amber-400/10 dark:text-amber-200 dark:ring-amber-400/15',
+            },
+            {
+              label: 'รายได้รวม',
+              value: `${teacherStats.totalRevenue.toLocaleString('th-TH')} บาท`,
+              icon: CircleDollarSign,
+              accentClass:
+                'bg-rose-50 text-rose-700 ring-rose-100 dark:bg-rose-400/10 dark:text-rose-200 dark:ring-rose-400/15',
+            },
+          ].map((item) => {
+            const Icon = item.icon
+
+            return (
+            <div
+              key={item.label}
+              className="flex items-center gap-3 rounded-lg border border-slate-200/80 bg-white px-4 py-3 shadow-sm shadow-slate-200/50 transition hover:border-slate-300 dark:border-white/10 dark:bg-slate-900 dark:shadow-black/20"
+            >
+              <span
+                className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md ring-1 ${item.accentClass}`}
+              >
+                <Icon size={18} />
+              </span>
+              <div className="min-w-0">
+                <p className="truncate text-xl font-semibold text-slate-950">{item.value}</p>
+                <p className="mt-0.5 truncate text-xs font-medium text-slate-500">{item.label}</p>
+              </div>
+            </div>
+          )})}
+        </section>
+
         <section className="card overflow-hidden">
-          <div className="border-b border-slate-200 p-5">
-            <h2 className="text-lg font-semibold text-slate-950">คอร์สของฉัน</h2>
-            <p className="mt-1 text-sm text-slate-500">
-              กดสร้างคอร์สเพื่อเปิด popup ใหม่ กดแก้ไขหรือกดลบจากแต่ละรายการได้ทันที
-            </p>
+          <div className="flex flex-col gap-4 border-b border-slate-200 p-5 lg:flex-row lg:items-center lg:justify-between">
+            <div>
+              <h2 className="text-lg font-semibold text-slate-950">คอร์สของฉัน</h2>
+              <p className="mt-1 text-sm text-slate-500">
+                กดสร้างคอร์สเพื่อเปิด popup ใหม่ กดแก้ไขหรือกดลบจากแต่ละรายการได้ทันที
+              </p>
+            </div>
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <label className="relative block min-w-0 sm:w-72">
+                <span className="sr-only">ค้นหาคอร์ส</span>
+                <Search
+                  size={15}
+                  className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"
+                />
+                <input
+                  value={courseSearch}
+                  onChange={(event) => setCourseSearch(event.target.value)}
+                  className="h-10 w-full rounded-md border border-slate-200 bg-slate-50 pl-9 pr-3 text-sm text-slate-950 outline-none transition placeholder:text-slate-400 focus:border-slate-400 focus:bg-white focus:ring-2 focus:ring-slate-200"
+                  placeholder="ค้นหาคอร์ส"
+                />
+              </label>
+              <label className="block sm:w-36">
+                <span className="sr-only">สถานะ</span>
+                <select
+                  className="h-10 w-full rounded-md border border-slate-200 bg-slate-50 px-3 text-sm font-medium text-slate-700 outline-none transition focus:border-slate-400 focus:bg-white focus:ring-2 focus:ring-slate-200"
+                  value={statusFilter}
+                  onChange={(event) => setStatusFilter(event.target.value as 'all' | Course['status'])}
+                >
+                  <option value="all">ทั้งหมด</option>
+                  <option value="published">เผยแพร่</option>
+                  <option value="draft">ฉบับร่าง</option>
+                  <option value="hidden">ซ่อน</option>
+                </select>
+              </label>
+            </div>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full min-w-[880px] border-collapse">
@@ -1080,7 +1483,7 @@ export default function TeacherDashboard() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200">
-                {courses.map((course) => (
+                {filteredCourses.map((course) => (
                   <tr key={course.id}>
                     <td className="table-cell">
                       <div className="flex items-center gap-3">
@@ -1144,6 +1547,12 @@ export default function TeacherDashboard() {
                 ))}
               </tbody>
             </table>
+            {filteredCourses.length === 0 ? (
+              <div className="p-8 text-center">
+                <h3 className="text-lg font-semibold text-slate-950">ไม่พบคอร์สที่ตรงกับตัวกรอง</h3>
+                <p className="mt-2 text-sm text-slate-500">ลองเปลี่ยนคำค้นหาหรือสถานะคอร์ส</p>
+              </div>
+            ) : null}
           </div>
         </section>
       </div>
@@ -1156,6 +1565,7 @@ export default function TeacherDashboard() {
           coverFile={coverFile}
           formMessage={message}
           saving={saving}
+          coverUploadProgress={coverUploadProgress}
           onClose={closeFormModal}
           onSubmit={handleSubmit}
           onDraftChange={handleDraftChange}
@@ -1179,6 +1589,9 @@ export default function TeacherDashboard() {
           editingLessonId={editingLessonId}
           saving={savingLesson}
           uploading={uploadingLessonVideo}
+          uploadProgress={lessonUploadProgress}
+          videoPreviewUrl={lessonVideoPreviewUrl}
+          videoPosterUrl={lessonVideoPosterUrl}
           message={lessonMessage}
           onClose={closeLessonManager}
           onNew={startNewLesson}

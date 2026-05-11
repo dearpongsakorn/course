@@ -2,6 +2,9 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import DashboardLayout from './layouts/DashboardLayout'
 import MainLayout from './layouts/MainLayout'
 import AdminDashboard from './pages/AdminDashboard'
+import Cart from './pages/Cart'
+import Checkout from './pages/Checkout'
+import Contact from './pages/Contact'
 import CourseDetail from './pages/CourseDetail'
 import Courses from './pages/Courses'
 import Home from './pages/Home'
@@ -18,6 +21,9 @@ function App() {
         <Route element={<MainLayout />}>
           <Route index element={<Home />} />
           <Route path="courses" element={<Courses />} />
+          <Route path="contact" element={<Contact />} />
+          <Route path="cart" element={<Cart />} />
+          <Route path="checkout/:slug" element={<Checkout />} />
           <Route path="login" element={<Login />} />
           <Route path="register" element={<Register />} />
           <Route path="courses/:slug" element={<CourseDetail />} />

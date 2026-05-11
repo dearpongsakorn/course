@@ -16,9 +16,37 @@ const aiModel = process.env.AI_MODEL ?? 'not-configured'
 const transcribeModel = process.env.TRANSCRIBE_MODEL ?? aiModel
 const geminiApiKey = process.env.GEMINI_API_KEY ?? ''
 const ffmpegBinary = process.env.FFMPEG_PATH ?? 'ffmpeg'
+const adminEmail = (process.env.ADMIN_EMAIL ?? 'admin@example.com').trim().toLowerCase()
+const adminPassword = process.env.ADMIN_PASSWORD ?? 'Admin12345'
+const studentEmail = (process.env.STUDENT_EMAIL ?? 'mintra@example.com').trim().toLowerCase()
+const studentPassword = process.env.STUDENT_PASSWORD ?? 'Student12345'
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const uploadsDir = path.join(rootDir, 'uploads')
 const uploadsTempDir = path.join(uploadsDir, 'tmp')
+const maxVideoUploadBytes = Number(process.env.MAX_VIDEO_UPLOAD_MB ?? 1024) * 1024 * 1024
+const maxImageUploadBytes = Number(process.env.MAX_IMAGE_UPLOAD_MB ?? 5) * 1024 * 1024
+const maxRawUploadBytes = maxVideoUploadBytes + 50 * 1024 * 1024
+const r2Endpoint = (process.env.R2_ENDPOINT ?? '').replace(/\/+$/g, '')
+const r2AccountId = process.env.R2_ACCOUNT_ID ?? ''
+const r2Bucket = process.env.R2_BUCKET ?? ''
+const r2AccessKeyId = process.env.R2_ACCESS_KEY_ID ?? ''
+const r2SecretAccessKey = process.env.R2_SECRET_ACCESS_KEY ?? ''
+const r2PublicBaseUrl = (process.env.R2_PUBLIC_BASE_URL ?? '').replace(/\/+$/g, '')
+const r2StorageEnabled = Boolean(
+  r2Bucket &&
+    r2AccessKeyId &&
+    r2SecretAccessKey &&
+    r2PublicBaseUrl &&
+    (r2Endpoint || r2AccountId),
+)
+const configuredR2MultipartPartMb = Number(process.env.R2_MULTIPART_PART_MB ?? 64)
+const r2MultipartPartSize =
+  Math.max(5, Number.isFinite(configuredR2MultipartPartMb) ? configuredR2MultipartPartMb : 64) * 1024 * 1024
+const configuredR2PresignExpiresSeconds = Number(process.env.R2_PRESIGN_EXPIRES_SECONDS ?? 900)
+const r2PresignExpiresSeconds = Math.min(
+  3600,
+  Math.max(60, Number.isFinite(configuredR2PresignExpiresSeconds) ? configuredR2PresignExpiresSeconds : 900),
+)
 const geminiClient =
   aiProvider === 'gemini' && geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null
 
@@ -140,6 +168,55 @@ const ensureAuthSchema = async () => {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `)
+}
+
+const upsertSeedUserCredential = async ({ id, name, email, role, password, avatarUrl = null, title = null, bio = null }) => {
+  const { passwordHash, passwordSalt } = hashPassword(password)
+
+  await query(
+    `
+      INSERT INTO users (id, name, email, role, avatar_url, title, bio, status, created_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', CURRENT_DATE)
+      ON CONFLICT (id) DO UPDATE
+      SET
+        email = EXCLUDED.email,
+        role = EXCLUDED.role,
+        status = 'active'
+    `,
+    [id, name, email, role, avatarUrl, title, bio],
+  )
+
+  await query(
+    `
+      INSERT INTO user_passwords (user_id, password_hash, password_salt, updated_at)
+      VALUES ($1, $2, $3, NOW())
+      ON CONFLICT (user_id) DO UPDATE
+      SET
+        password_hash = EXCLUDED.password_hash,
+        password_salt = EXCLUDED.password_salt,
+        updated_at = NOW()
+    `,
+    [id, passwordHash, passwordSalt],
+  )
+}
+
+const ensureSeedCredentials = async () => {
+  await upsertSeedUserCredential({
+    id: 'u-admin-1',
+    name: 'Admin LearnOS',
+    email: adminEmail,
+    role: 'admin',
+    password: adminPassword,
+  })
+
+  await upsertSeedUserCredential({
+    id: 'u-student-1',
+    name: 'มินตรา แก้ว',
+    email: studentEmail,
+    role: 'student',
+    password: studentPassword,
+    avatarUrl: 'https://images.unsplash.com/photo-1517841905240-472988babdf9?auto=format&fit=crop&w=300&q=80',
+  })
 }
 
 const ensureAiSchema = async () => {
@@ -295,6 +372,268 @@ const ensureUploadsDir = async () => {
   await mkdir(uploadsTempDir, { recursive: true })
 }
 
+const toSha256Hex = (value) => crypto.createHash('sha256').update(value).digest('hex')
+
+const hmac = (key, value, encoding) => crypto.createHmac('sha256', key).update(value).digest(encoding)
+
+const getR2SigningKey = (dateStamp) => {
+  const dateKey = hmac(`AWS4${r2SecretAccessKey}`, dateStamp)
+  const regionKey = hmac(dateKey, 'auto')
+  const serviceKey = hmac(regionKey, 's3')
+  return hmac(serviceKey, 'aws4_request')
+}
+
+const getR2Endpoint = () => r2Endpoint || `https://${r2AccountId}.r2.cloudflarestorage.com`
+
+const encodeR2Uri = (value) =>
+  encodeURIComponent(String(value)).replace(/[!'()*]/g, (character) =>
+    `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+  )
+
+const buildR2ObjectPath = (key) =>
+  `/${encodeR2Uri(r2Bucket)}/${String(key)
+    .split('/')
+    .map((part) => encodeR2Uri(part))
+    .join('/')}`
+
+const canonicalR2QueryString = (entries = []) =>
+  entries
+    .map(([key, value]) => [encodeR2Uri(key), encodeR2Uri(value ?? '')])
+    .sort(([leftKey, leftValue], [rightKey, rightValue]) => {
+      if (leftKey !== rightKey) return leftKey < rightKey ? -1 : 1
+      if (leftValue === rightValue) return 0
+      return leftValue < rightValue ? -1 : 1
+    })
+    .map(([key, value]) => `${key}=${value}`)
+    .join('&')
+
+const buildR2ObjectUrl = (key, queryEntries = []) => {
+  const queryString = canonicalR2QueryString(queryEntries)
+  return `${getR2Endpoint()}${buildR2ObjectPath(key)}${queryString ? `?${queryString}` : ''}`
+}
+
+const signR2Request = ({ method, key, queryEntries = [], headers = {}, body = Buffer.alloc(0) }) => {
+  const url = new URL(buildR2ObjectUrl(key, queryEntries))
+  const now = new Date()
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '')
+  const dateStamp = amzDate.slice(0, 8)
+  const payloadHash = toSha256Hex(body)
+  const credentialScope = `${dateStamp}/auto/s3/aws4_request`
+  const headersToSign = {
+    ...headers,
+    host: url.host,
+    'x-amz-content-sha256': payloadHash,
+    'x-amz-date': amzDate,
+  }
+  const canonicalHeaderEntries = Object.entries(headersToSign)
+    .map(([name, value]) => [name.toLowerCase(), String(value).trim().replace(/\s+/g, ' ')])
+    .sort(([leftName], [rightName]) => leftName.localeCompare(rightName))
+  const canonicalHeaders = canonicalHeaderEntries.map(([name, value]) => `${name}:${value}`).join('\n')
+  const signedHeaders = canonicalHeaderEntries.map(([name]) => name).join(';')
+  const canonicalRequest = [
+    method,
+    url.pathname,
+    canonicalR2QueryString(queryEntries),
+    `${canonicalHeaders}\n`,
+    signedHeaders,
+    payloadHash,
+  ].join('\n')
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    toSha256Hex(canonicalRequest),
+  ].join('\n')
+  const signature = hmac(getR2SigningKey(dateStamp), stringToSign, 'hex')
+  const authorization = `AWS4-HMAC-SHA256 Credential=${r2AccessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
+  const fetchHeaders = {
+    ...headers,
+    Authorization: authorization,
+    'x-amz-content-sha256': payloadHash,
+    'x-amz-date': amzDate,
+  }
+
+  return { url: url.toString(), headers: fetchHeaders }
+}
+
+const fetchR2SignedRequest = async ({ method, key, queryEntries = [], headers = {}, body = Buffer.alloc(0) }) => {
+  const signedRequest = signR2Request({ method, key, queryEntries, headers, body })
+
+  return fetch(signedRequest.url, {
+    method,
+    headers: signedRequest.headers,
+    body: method === 'GET' || method === 'HEAD' ? undefined : body,
+  })
+}
+
+const createR2PresignedPartUrl = ({ key, uploadId, partNumber }) => {
+  const now = new Date()
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '')
+  const dateStamp = amzDate.slice(0, 8)
+  const credentialScope = `${dateStamp}/auto/s3/aws4_request`
+  const url = new URL(buildR2ObjectUrl(key))
+  const queryEntries = [
+    ['partNumber', String(partNumber)],
+    ['uploadId', uploadId],
+    ['X-Amz-Algorithm', 'AWS4-HMAC-SHA256'],
+    ['X-Amz-Credential', `${r2AccessKeyId}/${credentialScope}`],
+    ['X-Amz-Date', amzDate],
+    ['X-Amz-Expires', String(r2PresignExpiresSeconds)],
+    ['X-Amz-SignedHeaders', 'host'],
+  ]
+  const canonicalRequest = [
+    'PUT',
+    url.pathname,
+    canonicalR2QueryString(queryEntries),
+    `host:${url.host}\n`,
+    'host',
+    'UNSIGNED-PAYLOAD',
+  ].join('\n')
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    toSha256Hex(canonicalRequest),
+  ].join('\n')
+  const signature = hmac(getR2SigningKey(dateStamp), stringToSign, 'hex')
+
+  return buildR2ObjectUrl(key, [...queryEntries, ['X-Amz-Signature', signature]])
+}
+
+const decodeXmlText = (value) =>
+  String(value)
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+
+const escapeXmlText = (value) =>
+  String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;')
+
+const ensureR2MultipartReady = () => {
+  if (r2StorageEnabled) return null
+
+  return {
+    statusCode: 501,
+    payload: { message: 'Cloudflare R2 ยังไม่ได้ตั้งค่า ระบบจะใช้การอัปโหลดผ่าน backend แทน' },
+  }
+}
+
+const getR2MultipartUploadId = async ({ key, contentType }) => {
+  const response = await fetchR2SignedRequest({
+    method: 'POST',
+    key,
+    queryEntries: [['uploads', '']],
+    headers: { 'Content-Type': contentType },
+  })
+  const responseText = await response.text().catch(() => '')
+
+  if (!response.ok) {
+    throw new Error(`เริ่ม multipart upload ไป R2 ไม่สำเร็จ (${response.status})${responseText ? `: ${responseText}` : ''}`)
+  }
+
+  const uploadId = responseText.match(/<UploadId>([^<]+)<\/UploadId>/)?.[1]
+
+  if (!uploadId) {
+    throw new Error('R2 ไม่ได้ส่ง UploadId กลับมา')
+  }
+
+  return decodeXmlText(uploadId)
+}
+
+const completeR2MultipartUpload = async ({ key, uploadId, parts }) => {
+  const completeBody = Buffer.from(
+    [
+      '<CompleteMultipartUpload>',
+      ...parts.map(
+        (part) =>
+          `<Part><PartNumber>${part.partNumber}</PartNumber><ETag>${escapeXmlText(part.etag)}</ETag></Part>`,
+      ),
+      '</CompleteMultipartUpload>',
+    ].join(''),
+  )
+  const response = await fetchR2SignedRequest({
+    method: 'POST',
+    key,
+    queryEntries: [['uploadId', uploadId]],
+    headers: { 'Content-Type': 'application/xml' },
+    body: completeBody,
+  })
+
+  if (!response.ok) {
+    const responseText = await response.text().catch(() => '')
+    throw new Error(`ยืนยัน multipart upload ไป R2 ไม่สำเร็จ (${response.status})${responseText ? `: ${responseText}` : ''}`)
+  }
+}
+
+const abortR2MultipartUpload = async ({ key, uploadId }) => {
+  const response = await fetchR2SignedRequest({
+    method: 'DELETE',
+    key,
+    queryEntries: [['uploadId', uploadId]],
+  })
+
+  return response.ok || response.status === 404
+}
+
+const putObjectToR2 = async ({ key, contentType, body }) => {
+  if (!r2StorageEnabled) return null
+
+  const endpoint = getR2Endpoint()
+  const url = new URL(`${endpoint}/${r2Bucket}/${key}`)
+  const now = new Date()
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '')
+  const dateStamp = amzDate.slice(0, 8)
+  const payloadHash = toSha256Hex(body)
+  const credentialScope = `${dateStamp}/auto/s3/aws4_request`
+  const canonicalHeaders = [
+    `host:${url.host}`,
+    `x-amz-content-sha256:${payloadHash}`,
+    `x-amz-date:${amzDate}`,
+  ].join('\n')
+  const signedHeaders = 'host;x-amz-content-sha256;x-amz-date'
+  const canonicalRequest = [
+    'PUT',
+    url.pathname,
+    '',
+    `${canonicalHeaders}\n`,
+    signedHeaders,
+    payloadHash,
+  ].join('\n')
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    toSha256Hex(canonicalRequest),
+  ].join('\n')
+  const signature = hmac(getR2SigningKey(dateStamp), stringToSign, 'hex')
+  const authorization = `AWS4-HMAC-SHA256 Credential=${r2AccessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
+
+  const response = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      Authorization: authorization,
+      'Content-Type': contentType,
+      'x-amz-content-sha256': payloadHash,
+      'x-amz-date': amzDate,
+    },
+    body,
+  })
+
+  if (!response.ok) {
+    const details = await response.text().catch(() => '')
+    throw new Error(`อัปโหลดไป Cloudflare R2 ไม่สำเร็จ (${response.status})${details ? `: ${details}` : ''}`)
+  }
+
+  return `${r2PublicBaseUrl}/${key}`
+}
+
 const transcodeVideoToMp4 = async (inputPath, outputPath) =>
   new Promise((resolve, reject) => {
     const ffmpeg = spawn(
@@ -409,11 +748,39 @@ const probeVideoStreams = async (absolutePath) =>
     })
   })
 
+const isBrowserFriendlyMp4 = (streams) => {
+  const videoStream = streams.find((stream) => stream.codec_type === 'video')
+  const audioStream = streams.find((stream) => stream.codec_type === 'audio')
+  const videoCodec = String(videoStream?.codec_name ?? '').toLowerCase()
+  const audioCodec = String(audioStream?.codec_name ?? '').toLowerCase()
+
+  return videoCodec === 'h264' && (!audioStream || ['aac', 'mp3'].includes(audioCodec))
+}
+
 const getLocalUploadPath = (fileUrl) => {
   if (!fileUrl || !String(fileUrl).startsWith('/uploads/')) return null
 
   const fileName = path.basename(String(fileUrl))
   return path.join(uploadsDir, fileName)
+}
+
+const isRemoteHttpUrl = (value) => /^https?:\/\//i.test(String(value ?? ''))
+
+const downloadRemoteFile = async (fileUrl) => {
+  await ensureUploadsDir()
+
+  const response = await fetch(fileUrl)
+
+  if (!response.ok) {
+    throw new Error(`ไม่สามารถดาวน์โหลดไฟล์วิดีโอจาก storage ได้ (${response.status})`)
+  }
+
+  const extension = path.extname(new URL(fileUrl).pathname) || '.mp4'
+  const tempPath = path.join(uploadsTempDir, `remote-${crypto.randomUUID()}${extension}`)
+  const bytes = Buffer.from(await response.arrayBuffer())
+  await writeFile(tempPath, bytes)
+
+  return tempPath
 }
 
 const mimeTypeForFile = (absolutePath) => {
@@ -487,22 +854,43 @@ const saveLessonTranscript = async (lessonId, transcript, source = 'manual') => 
 }
 
 const autoTranscribeLesson = async (lessonId, videoUrl) => {
-  const absolutePath = getLocalUploadPath(videoUrl)
-  if (!absolutePath) return
-
   if (aiProvider !== 'gemini') {
     console.warn(`Skip transcript for lesson ${lessonId}: AI_PROVIDER is not gemini`)
     return
   }
 
+  let absolutePath = getLocalUploadPath(videoUrl)
+  let shouldDeleteTempFile = false
+
   try {
+    if (!absolutePath && isRemoteHttpUrl(videoUrl)) {
+      absolutePath = await downloadRemoteFile(videoUrl)
+      shouldDeleteTempFile = true
+    }
+
+    if (!absolutePath) return
+
     await stat(absolutePath)
     const transcript = await transcribeVideoWithGemini(absolutePath)
     await saveLessonTranscript(lessonId, transcript, 'gemini')
     console.log(`Generated Gemini transcript for lesson ${lessonId}`)
   } catch (error) {
     console.error(`Failed to generate Gemini transcript for lesson ${lessonId}`, error)
+  } finally {
+    if (shouldDeleteTempFile && absolutePath) {
+      await unlink(absolutePath).catch(() => {})
+    }
   }
+}
+
+const queueAutoTranscribeLesson = (lessonId, videoUrl) => {
+  if (!videoUrl) return
+
+  setTimeout(() => {
+    autoTranscribeLesson(lessonId, videoUrl).catch((error) => {
+      console.error(`Failed to queue transcript for lesson ${lessonId}`, error)
+    })
+  }, 0)
 }
 
 const normalizeExistingUploadedVideos = async () => {
@@ -564,7 +952,7 @@ const parseDataUrl = (value) => {
   }
 }
 
-const readRawBody = async (request, maxBytes = 550 * 1024 * 1024) =>
+const readRawBody = async (request, maxBytes = maxRawUploadBytes) =>
   new Promise((resolve, reject) => {
     const chunks = []
     let totalBytes = 0
@@ -573,7 +961,7 @@ const readRawBody = async (request, maxBytes = 550 * 1024 * 1024) =>
       totalBytes += chunk.length
 
       if (totalBytes > maxBytes) {
-        const error = new Error('ไฟล์วิดีโอต้องไม่เกิน 500MB')
+        const error = new Error(`ไฟล์วิดีโอต้องไม่เกิน ${Math.round(maxVideoUploadBytes / 1024 / 1024)}MB`)
         error.statusCode = 413
         reject(error)
         request.destroy()
@@ -596,28 +984,35 @@ const parseMultipartFormData = (contentType, buffer) => {
   }
 
   const boundary = boundaryMatch[1] ?? boundaryMatch[2]
-  const boundaryToken = `--${boundary}`
-  const rawText = buffer.toString('latin1')
-  const segments = rawText
-    .split(boundaryToken)
-    .slice(1, -1)
-    .map((segment) => {
-      let normalized = segment
-      if (normalized.startsWith('\r\n')) normalized = normalized.slice(2)
-      if (normalized.endsWith('\r\n')) normalized = normalized.slice(0, -2)
-      return normalized
-    })
-    .filter(Boolean)
-
+  const boundaryToken = Buffer.from(`--${boundary}`)
+  const headerSeparator = Buffer.from('\r\n\r\n')
   const fields = {}
   let filePart = null
+  let cursor = 0
 
-  for (const segment of segments) {
-    const headerEnd = segment.indexOf('\r\n\r\n')
+  while (cursor < buffer.length) {
+    const boundaryStart = buffer.indexOf(boundaryToken, cursor)
+    if (boundaryStart === -1) break
+
+    let segmentStart = boundaryStart + boundaryToken.length
+
+    if (buffer[segmentStart] === 45 && buffer[segmentStart + 1] === 45) break
+    if (buffer[segmentStart] === 13 && buffer[segmentStart + 1] === 10) segmentStart += 2
+
+    const nextBoundaryStart = buffer.indexOf(boundaryToken, segmentStart)
+    if (nextBoundaryStart === -1) break
+
+    let segmentEnd = nextBoundaryStart
+    if (buffer[segmentEnd - 2] === 13 && buffer[segmentEnd - 1] === 10) segmentEnd -= 2
+
+    const segment = buffer.subarray(segmentStart, segmentEnd)
+    cursor = nextBoundaryStart
+
+    const headerEnd = segment.indexOf(headerSeparator)
     if (headerEnd === -1) continue
 
-    const headerText = segment.slice(0, headerEnd)
-    const bodyText = segment.slice(headerEnd + 4)
+    const headerText = segment.subarray(0, headerEnd).toString('latin1')
+    const bodyBuffer = segment.subarray(headerEnd + headerSeparator.length)
     const disposition = headerText.match(/name="([^"]+)"/i)
 
     if (!disposition) continue
@@ -631,11 +1026,12 @@ const parseMultipartFormData = (contentType, buffer) => {
         fieldName,
         fileName: fileNameMatch[1],
         mimeType: mimeTypeMatch?.[1]?.trim() ?? 'application/octet-stream',
-        buffer: Buffer.from(bodyText, 'latin1'),
+        buffer: bodyBuffer,
       }
     } else {
-      fields[fieldName] = Buffer.from(bodyText, 'latin1').toString('utf8')
+      fields[fieldName] = bodyBuffer.toString('utf8')
     }
+
   }
 
   return { fields, filePart }
@@ -654,12 +1050,17 @@ const persistUploadedFile = async ({ kind, fileName, mimeType, buffer }) => {
     }
   }
 
-  const maxBytes = kind === 'video' ? 500 * 1024 * 1024 : 5 * 1024 * 1024
+  const maxBytes = kind === 'video' ? maxVideoUploadBytes : maxImageUploadBytes
 
   if (buffer.byteLength > maxBytes) {
     return {
       statusCode: 400,
-      payload: { message: kind === 'video' ? 'วิดีโอต้องไม่เกิน 500MB' : 'รูปต้องไม่เกิน 5MB' },
+      payload: {
+        message:
+          kind === 'video'
+            ? `วิดีโอต้องไม่เกิน ${Math.round(maxVideoUploadBytes / 1024 / 1024)}MB`
+            : `รูปต้องไม่เกิน ${Math.round(maxImageUploadBytes / 1024 / 1024)}MB`,
+      },
     }
   }
 
@@ -675,16 +1076,76 @@ const persistUploadedFile = async ({ kind, fileName, mimeType, buffer }) => {
   await ensureUploadsDir()
 
   if (kind === 'video') {
-    const tempInputPath = path.join(uploadsTempDir, `input-${crypto.randomUUID()}${extension}`)
+    let tempInputPath = path.join(uploadsTempDir, `input-${crypto.randomUUID()}${extension}`)
     const outputFileName = `${kind}-${Date.now()}-${crypto.randomUUID()}.mp4`
-    const outputPath = path.join(uploadsDir, outputFileName)
+    const outputPath = path.join(r2StorageEnabled ? uploadsTempDir : uploadsDir, outputFileName)
+    let storedVideoPath = outputPath
 
     await writeFile(tempInputPath, buffer)
 
     try {
-      await transcodeVideoToMp4(tempInputPath, outputPath)
+      let canReuseOriginal = false
+
+      try {
+        canReuseOriginal = isBrowserFriendlyMp4(await probeVideoStreams(tempInputPath))
+      } catch (error) {
+        console.warn('Could not inspect uploaded video codec, transcoding instead', error)
+      }
+
+      if (canReuseOriginal) {
+        if (r2StorageEnabled) {
+          storedVideoPath = tempInputPath
+        } else {
+          await rename(tempInputPath, outputPath)
+          tempInputPath = ''
+        }
+      } else {
+        await transcodeVideoToMp4(tempInputPath, outputPath)
+      }
     } finally {
-      await unlink(tempInputPath).catch(() => {})
+      if (tempInputPath && storedVideoPath !== tempInputPath) {
+        await unlink(tempInputPath).catch(() => {})
+      }
+    }
+
+    try {
+      const finalStreams = await probeVideoStreams(storedVideoPath)
+      const videoStream = finalStreams.find((stream) => stream.codec_type === 'video')
+
+      if (!videoStream) {
+        throw new Error('ไม่พบ video stream')
+      }
+    } catch (error) {
+      await unlink(storedVideoPath).catch(() => {})
+      const invalidVideoError = new Error(
+        'ไฟล์วิดีโอไม่สมบูรณ์หรือ browser อ่านภาพไม่ได้ กรุณา export เป็น MP4 แบบ H.264/AAC แล้วอัปโหลดใหม่',
+      )
+      invalidVideoError.statusCode = 400
+      throw invalidVideoError
+    }
+
+    if (r2StorageEnabled) {
+      try {
+        const uploadedUrl = await putObjectToR2({
+          key: `videos/${outputFileName}`,
+          contentType: 'video/mp4',
+          body: await readFile(storedVideoPath),
+        })
+
+        return {
+          statusCode: 201,
+          payload: {
+            data: {
+              kind,
+              fileName: outputFileName,
+              fileUrl: uploadedUrl,
+              storage: 'r2',
+            },
+          },
+        }
+      } finally {
+        await unlink(storedVideoPath).catch(() => {})
+      }
     }
 
     return {
@@ -694,6 +1155,27 @@ const persistUploadedFile = async ({ kind, fileName, mimeType, buffer }) => {
           kind,
           fileName: outputFileName,
           fileUrl: `/uploads/${outputFileName}`,
+          storage: 'local',
+        },
+      },
+    }
+  }
+
+  if (r2StorageEnabled) {
+    const uploadedUrl = await putObjectToR2({
+      key: `${kind}s/${finalFileName}`,
+      contentType: mimeType,
+      body: buffer,
+    })
+
+    return {
+      statusCode: 201,
+      payload: {
+        data: {
+          kind,
+          fileName: finalFileName,
+          fileUrl: uploadedUrl,
+          storage: 'r2',
         },
       },
     }
@@ -708,6 +1190,7 @@ const persistUploadedFile = async ({ kind, fileName, mimeType, buffer }) => {
         kind,
         fileName: finalFileName,
         fileUrl: `/uploads/${finalFileName}`,
+        storage: 'local',
       },
     },
   }
@@ -721,6 +1204,14 @@ const saveUploadAsset = async (request) => {
   }
 
   const contentType = String(request.headers['content-type'] ?? '')
+  const contentLength = Number(request.headers['content-length'] ?? 0)
+
+  if (contentLength > maxRawUploadBytes) {
+    return {
+      statusCode: 413,
+      payload: { message: `ไฟล์วิดีโอต้องไม่เกิน ${Math.round(maxVideoUploadBytes / 1024 / 1024)}MB` },
+    }
+  }
 
   if (contentType.includes('multipart/form-data')) {
     const rawBody = await readRawBody(request)
@@ -758,6 +1249,189 @@ const saveUploadAsset = async (request) => {
 
   const { mimeType, buffer } = parseDataUrl(dataUrl)
   return persistUploadedFile({ kind, fileName, mimeType, buffer })
+}
+
+const authorizeCourseAssetUpload = async (request) => {
+  const authUser = await getAuthUser(request)
+
+  if (!authUser) {
+    return {
+      authUser: null,
+      error: { statusCode: 401, payload: { message: 'กรุณาเข้าสู่ระบบก่อนอัปโหลดไฟล์' } },
+    }
+  }
+
+  if (!['teacher', 'admin'].includes(authUser.role)) {
+    return {
+      authUser,
+      error: { statusCode: 403, payload: { message: 'บัญชีนี้ไม่มีสิทธิ์อัปโหลดไฟล์คอร์ส' } },
+    }
+  }
+
+  return { authUser, error: null }
+}
+
+const isSafeR2VideoKey = (key) => /^videos\/video-\d+-[0-9a-f-]+\.mp4$/i.test(key)
+
+const normalizeR2MultipartParts = (parts) => {
+  if (!Array.isArray(parts) || parts.length === 0) return null
+
+  const normalizedParts = []
+  const seenPartNumbers = new Set()
+
+  for (const part of parts) {
+    const partNumber = Number(part?.partNumber)
+    const rawEtag = String(part?.etag ?? '').trim()
+
+    if (
+      !Number.isInteger(partNumber) ||
+      partNumber < 1 ||
+      partNumber > 10000 ||
+      !rawEtag ||
+      seenPartNumbers.has(partNumber)
+    ) {
+      return null
+    }
+
+    seenPartNumbers.add(partNumber)
+    normalizedParts.push({
+      partNumber,
+      etag: rawEtag.startsWith('"') ? rawEtag : `"${rawEtag}"`,
+    })
+  }
+
+  return normalizedParts.sort((left, right) => left.partNumber - right.partNumber)
+}
+
+const startR2MultipartVideoUpload = async (request) => {
+  const { error } = await authorizeCourseAssetUpload(request)
+  if (error) return error
+
+  const r2ReadyError = ensureR2MultipartReady()
+  if (r2ReadyError) return r2ReadyError
+
+  const body = await readBody(request)
+  const fileName = String(body.fileName ?? '').trim()
+  const mimeType = String(body.mimeType ?? '').trim().toLowerCase()
+  const fileSize = Number(body.fileSize ?? 0)
+  const isMp4 = mimeType === 'video/mp4' || fileName.toLowerCase().endsWith('.mp4')
+
+  if (String(body.kind ?? 'video') !== 'video' || !fileName || !Number.isFinite(fileSize) || fileSize <= 0) {
+    return { statusCode: 400, payload: { message: 'ข้อมูลวิดีโอไม่ครบ' } }
+  }
+
+  if (!isMp4) {
+    return { statusCode: 400, payload: { message: 'รองรับวิดีโอ MP4 เท่านั้น' } }
+  }
+
+  if (fileSize > maxVideoUploadBytes) {
+    return {
+      statusCode: 413,
+      payload: { message: `วิดีโอต้องไม่เกิน ${Math.round(maxVideoUploadBytes / 1024 / 1024)}MB` },
+    }
+  }
+
+  const outputFileName = `video-${Date.now()}-${crypto.randomUUID()}.mp4`
+  const key = `videos/${outputFileName}`
+  const uploadId = await getR2MultipartUploadId({ key, contentType: 'video/mp4' })
+
+  return {
+    statusCode: 201,
+    payload: {
+      data: {
+        kind: 'video',
+        key,
+        uploadId,
+        fileName: outputFileName,
+        fileUrl: `${r2PublicBaseUrl}/${key}`,
+        partSize: r2MultipartPartSize,
+        maxBytes: maxVideoUploadBytes,
+        storage: 'r2',
+      },
+    },
+  }
+}
+
+const signR2MultipartVideoPart = async (request) => {
+  const { error } = await authorizeCourseAssetUpload(request)
+  if (error) return error
+
+  const r2ReadyError = ensureR2MultipartReady()
+  if (r2ReadyError) return r2ReadyError
+
+  const body = await readBody(request)
+  const key = String(body.key ?? '').trim()
+  const uploadId = String(body.uploadId ?? '').trim()
+  const partNumber = Number(body.partNumber)
+
+  if (!isSafeR2VideoKey(key) || !uploadId || uploadId.length > 2048) {
+    return { statusCode: 400, payload: { message: 'ข้อมูล multipart upload ไม่ถูกต้อง' } }
+  }
+
+  if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > 10000) {
+    return { statusCode: 400, payload: { message: 'เลข part ไม่ถูกต้อง' } }
+  }
+
+  return {
+    statusCode: 200,
+    payload: {
+      data: {
+        url: createR2PresignedPartUrl({ key, uploadId, partNumber }),
+        expiresIn: r2PresignExpiresSeconds,
+      },
+    },
+  }
+}
+
+const finishR2MultipartVideoUpload = async (request) => {
+  const { error } = await authorizeCourseAssetUpload(request)
+  if (error) return error
+
+  const r2ReadyError = ensureR2MultipartReady()
+  if (r2ReadyError) return r2ReadyError
+
+  const body = await readBody(request)
+  const key = String(body.key ?? '').trim()
+  const uploadId = String(body.uploadId ?? '').trim()
+  const parts = normalizeR2MultipartParts(body.parts)
+
+  if (!isSafeR2VideoKey(key) || !uploadId || uploadId.length > 2048 || !parts) {
+    return { statusCode: 400, payload: { message: 'ข้อมูล multipart upload ไม่ครบ' } }
+  }
+
+  await completeR2MultipartUpload({ key, uploadId, parts })
+
+  return {
+    statusCode: 201,
+    payload: {
+      data: {
+        kind: 'video',
+        fileName: key.split('/').pop(),
+        fileUrl: `${r2PublicBaseUrl}/${key}`,
+        storage: 'r2',
+      },
+    },
+  }
+}
+
+const cancelR2MultipartVideoUpload = async (request) => {
+  const { error } = await authorizeCourseAssetUpload(request)
+  if (error) return error
+
+  const r2ReadyError = ensureR2MultipartReady()
+  if (r2ReadyError) return r2ReadyError
+
+  const body = await readBody(request)
+  const key = String(body.key ?? '').trim()
+  const uploadId = String(body.uploadId ?? '').trim()
+
+  if (!isSafeR2VideoKey(key) || !uploadId || uploadId.length > 2048) {
+    return { statusCode: 400, payload: { message: 'ข้อมูล multipart upload ไม่ถูกต้อง' } }
+  }
+
+  await abortR2MultipartUpload({ key, uploadId })
+
+  return { statusCode: 200, payload: { data: { ok: true } } }
 }
 
 const saveTranscript = async (request, lessonId) => {
@@ -944,6 +1618,22 @@ const getAuthUser = async (request) => {
   return result.rows[0] ?? null
 }
 
+const requireRole = async (request, roles) => {
+  const authUser = await getAuthUser(request)
+
+  if (!authUser || !roles.includes(authUser.role)) {
+    return {
+      authUser: null,
+      error: {
+        statusCode: authUser ? 403 : 401,
+        payload: { message: authUser ? 'Forbidden' : 'Unauthorized' },
+      },
+    }
+  }
+
+  return { authUser, error: null }
+}
+
 const createSession = async (userId) => {
   const token = crypto.randomBytes(32).toString('hex')
   await query(
@@ -964,14 +1654,26 @@ const dashboardPathForRole = (role) => {
   return '/student'
 }
 
+const loginIdentifierToEmail = (identifier) => {
+  const normalized = String(identifier ?? '').trim().toLowerCase()
+  const aliases = {
+    admin: adminEmail,
+    student: studentEmail,
+    learner: studentEmail,
+    'นักเรียน': studentEmail,
+  }
+
+  return aliases[normalized] ?? normalized
+}
+
 const login = async (request) => {
   const body = await readBody(request)
-  const email = String(body.email ?? '').trim().toLowerCase()
+  const email = loginIdentifierToEmail(body.email)
   const password = String(body.password ?? '')
   const role = body.role ? String(body.role) : null
 
   if (!email || !password) {
-    return { statusCode: 400, payload: { message: 'Email and password are required' } }
+    return { statusCode: 400, payload: { message: 'Email or username and password are required' } }
   }
 
   const result = await query(
@@ -1617,9 +2319,7 @@ const createCourse = async (request) => {
       ],
     )
 
-    if (body.videoUrl) {
-      await autoTranscribeLesson(lessonId, String(body.videoUrl))
-    }
+    if (body.videoUrl) queueAutoTranscribeLesson(lessonId, String(body.videoUrl))
   }
 
   return getCourseBySlug(result.rows[0].slug)
@@ -1722,9 +2422,7 @@ const saveCourseLesson = async (request, slug, lessonId) => {
       [title, duration, preview, videoUrl || null, summary, lessonId],
     )
 
-    if (videoUrl) {
-      await autoTranscribeLesson(lessonId, videoUrl)
-    }
+    if (videoUrl) queueAutoTranscribeLesson(lessonId, videoUrl)
   } else {
     const sortResult = await query(
       'SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_sort_order FROM lessons WHERE course_id = $1',
@@ -1749,9 +2447,7 @@ const saveCourseLesson = async (request, slug, lessonId) => {
       ],
     )
 
-    if (videoUrl) {
-      await autoTranscribeLesson(nextLessonId, videoUrl)
-    }
+    if (videoUrl) queueAutoTranscribeLesson(nextLessonId, videoUrl)
   }
 
   return { statusCode: 200, payload: { data: await getCourseBySlug(permission.course.slug) } }
@@ -1778,6 +2474,30 @@ const updateCourseStatus = async (request, slug) => {
   ])
 
   return { statusCode: 200, payload: { data: await getCourseBySlug(permission.course.slug) } }
+}
+
+const updateCoursePopularity = async (request, slug) => {
+  const authUser = await getAuthUser(request)
+
+  if (!authUser || authUser.role !== 'admin') {
+    return { statusCode: authUser ? 403 : 401, payload: { message: authUser ? 'Forbidden' : 'Unauthorized' } }
+  }
+
+  const course = await getCourseBySlug(slug)
+
+  if (!course) {
+    return { statusCode: 404, payload: { message: 'Course not found' } }
+  }
+
+  const body = await readBody(request)
+  const isPopular = Boolean(body.isPopular)
+
+  await query('UPDATE courses SET is_popular = $1, updated_at = CURRENT_DATE WHERE id = $2', [
+    isPopular,
+    course.id,
+  ])
+
+  return { statusCode: 200, payload: { data: await getCourseBySlug(course.slug) } }
 }
 
 const deleteCourseLesson = async (request, slug, lessonId) => {
@@ -1893,6 +2613,55 @@ const enrollInCourse = async (request, slug) => {
   }
 }
 
+const completeCourseLesson = async (request, slug, lessonId) => {
+  const authUser = await getAuthUser(request)
+
+  if (!authUser) {
+    return { statusCode: 401, payload: { message: 'กรุณาเข้าสู่ระบบก่อนบันทึกความคืบหน้า' } }
+  }
+
+  if (authUser.role !== 'student') {
+    return { statusCode: 403, payload: { message: 'บัญชีนี้ไม่สามารถบันทึกความคืบหน้าการเรียนได้' } }
+  }
+
+  const course = await getCourseBySlug(slug)
+
+  if (!course || course.status !== 'published') {
+    return { statusCode: 404, payload: { message: 'Course not found' } }
+  }
+
+  const lessonIndex = course.lessons.findIndex((lesson) => lesson.id === lessonId)
+
+  if (lessonIndex < 0) {
+    return { statusCode: 404, payload: { message: 'Lesson not found' } }
+  }
+
+  const enrollment = await getEnrollmentRecord(authUser.id, course.id)
+
+  if (!enrollment) {
+    return { statusCode: 403, payload: { message: 'กรุณาสมัครเรียนคอร์สนี้ก่อนบันทึกความคืบหน้า' } }
+  }
+
+  const completedLessons = Math.max(enrollment.completedLessons, lessonIndex + 1)
+  const progress = Math.min(100, Math.round((completedLessons / Math.max(course.lessons.length, 1)) * 100))
+
+  await query(
+    `
+      UPDATE enrollments
+      SET progress = $1, completed_lessons = $2, last_lesson_id = $3
+      WHERE student_id = $4 AND course_id = $5
+    `,
+    [progress, completedLessons, lessonId, authUser.id, course.id],
+  )
+
+  return {
+    statusCode: 200,
+    payload: {
+      data: await getEnrollmentRecord(authUser.id, course.id),
+    },
+  }
+}
+
 const routeRequest = async (request, response) => {
   const url = new URL(request.url ?? '/', `http://${request.headers.host}`)
 
@@ -1909,6 +2678,7 @@ const routeRequest = async (request, response) => {
   if (url.pathname === '/api/health' && request.method === 'GET') {
     await query('SELECT 1')
     await ensureAuthSchema()
+    await ensureSeedCredentials()
     await ensureCourseSchema()
     sendJson(response, 200, {
       status: 'ok',
@@ -2007,6 +2777,30 @@ const routeRequest = async (request, response) => {
     return
   }
 
+  if (url.pathname === '/api/uploads/r2/multipart/start' && request.method === 'POST') {
+    const result = await startR2MultipartVideoUpload(request)
+    sendJson(response, result.statusCode, result.payload)
+    return
+  }
+
+  if (url.pathname === '/api/uploads/r2/multipart/sign-part' && request.method === 'POST') {
+    const result = await signR2MultipartVideoPart(request)
+    sendJson(response, result.statusCode, result.payload)
+    return
+  }
+
+  if (url.pathname === '/api/uploads/r2/multipart/complete' && request.method === 'POST') {
+    const result = await finishR2MultipartVideoUpload(request)
+    sendJson(response, result.statusCode, result.payload)
+    return
+  }
+
+  if (url.pathname === '/api/uploads/r2/multipart/abort' && request.method === 'POST') {
+    const result = await cancelR2MultipartVideoUpload(request)
+    sendJson(response, result.statusCode, result.payload)
+    return
+  }
+
   if (url.pathname.startsWith('/api/courses/') && request.method === 'GET') {
     const slug = decodeURIComponent(url.pathname.replace('/api/courses/', ''))
     const authUser = await getAuthUser(request)
@@ -2029,14 +2823,24 @@ const routeRequest = async (request, response) => {
     return
   }
 
+  if (url.pathname.startsWith('/api/courses/') && request.method === 'POST' && url.pathname.endsWith('/popular')) {
+    const slug = decodeURIComponent(url.pathname.replace('/api/courses/', '').replace('/popular', ''))
+    const result = await updateCoursePopularity(request, slug)
+    sendJson(response, result.statusCode, result.payload)
+    return
+  }
+
   if (url.pathname.startsWith('/api/courses/') && request.method === 'POST' && url.pathname.includes('/lessons')) {
     const lessonPath = url.pathname.replace('/api/courses/', '')
     const [encodedSlug, , encodedLessonId, action] = lessonPath.split('/')
     const slug = decodeURIComponent(encodedSlug ?? '')
     const lessonId = encodedLessonId ? decodeURIComponent(encodedLessonId) : ''
-    const result = action === 'delete'
-      ? await deleteCourseLesson(request, slug, lessonId)
-      : await saveCourseLesson(request, slug, lessonId || null)
+    const result =
+      action === 'complete'
+        ? await completeCourseLesson(request, slug, lessonId)
+        : action === 'delete'
+          ? await deleteCourseLesson(request, slug, lessonId)
+          : await saveCourseLesson(request, slug, lessonId || null)
 
     sendJson(response, result.statusCode, result.payload)
     return
@@ -2057,6 +2861,12 @@ const routeRequest = async (request, response) => {
   }
 
   if (url.pathname === '/api/users' && request.method === 'GET') {
+    const { error: roleError } = await requireRole(request, ['admin'])
+    if (roleError) {
+      sendJson(response, roleError.statusCode, roleError.payload)
+      return
+    }
+
     const result = await query('SELECT * FROM users ORDER BY created_at DESC')
     sendJson(response, 200, { data: result.rows.map(toUser) })
     return
@@ -2099,6 +2909,12 @@ const routeRequest = async (request, response) => {
   }
 
   if (url.pathname === '/api/admin/dashboard' && request.method === 'GET') {
+    const { error: roleError } = await requireRole(request, ['admin'])
+    if (roleError) {
+      sendJson(response, roleError.statusCode, roleError.payload)
+      return
+    }
+
     sendJson(response, 200, { data: await getAdminDashboard() })
     return
   }
@@ -2133,6 +2949,7 @@ const server = http.createServer((request, response) => {
 })
 
 ensureAuthSchema()
+  .then(ensureSeedCredentials)
   .then(ensureCourseSchema)
   .then(ensureAiSchema)
   .then(normalizeExistingUploadedVideos)

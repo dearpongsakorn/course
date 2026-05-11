@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router-dom'
-import { BarChart3, BookOpenCheck, Library, ShieldCheck, UserRound, Users } from 'lucide-react'
+import { BarChart3, BookOpenCheck, Library, Settings, ShieldCheck, UserRound, Users } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import type { User, UserRole } from '../types/user'
 
@@ -43,21 +43,36 @@ export default function Sidebar({
 
   return (
     <aside className="card h-fit overflow-hidden">
-      <div className="border-b border-slate-200 p-4">
-        <div className="flex items-center gap-3">
-          {user?.avatarUrl ? (
-            <img src={user.avatarUrl} alt={user.name} className="h-11 w-11 rounded-md object-cover" />
-          ) : (
-            <span className="inline-flex h-11 w-11 items-center justify-center rounded-md bg-slate-950 text-white">
-              <ShieldCheck size={18} />
-            </span>
-          )}
+      {role === 'student' ? (
+        <Link
+          to="/student?section=settings"
+          className="flex items-center gap-3 border-b border-slate-200 p-4 transition hover:bg-slate-50 dark:hover:bg-white/5"
+        >
+          <span className="inline-flex h-11 w-11 items-center justify-center rounded-md bg-slate-950 text-white dark:bg-white dark:text-slate-950">
+            <Settings size={18} />
+          </span>
           <div className="min-w-0">
-            <p className="truncate text-sm font-semibold text-slate-950">{user?.name ?? roleLabels[role]}</p>
-            <p className="truncate text-xs text-slate-500">{user?.email ?? roleLabels[role]}</p>
+            <p className="truncate text-sm font-semibold text-slate-950">การตั้งค่า</p>
+            <p className="truncate text-xs text-slate-500">จัดการบัญชีผู้เรียน</p>
+          </div>
+        </Link>
+      ) : (
+        <div className="border-b border-slate-200 p-4">
+          <div className="flex items-center gap-3">
+            {user?.avatarUrl ? (
+              <img src={user.avatarUrl} alt={user.name} className="h-11 w-11 rounded-md object-cover" />
+            ) : (
+              <span className="inline-flex h-11 w-11 items-center justify-center rounded-md bg-slate-950 text-white dark:bg-white dark:text-slate-950">
+                <ShieldCheck size={18} />
+              </span>
+            )}
+            <div className="min-w-0">
+              <p className="truncate text-sm font-semibold text-slate-950">{user?.name ?? roleLabels[role]}</p>
+              <p className="truncate text-xs text-slate-500">{user?.email ?? roleLabels[role]}</p>
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
       <nav className="flex gap-2 overflow-x-auto p-3 lg:block lg:space-y-1">
         {itemsByRole[role].map((item) => {
@@ -70,7 +85,9 @@ export default function Sidebar({
               to={item.to}
               className={[
                 'flex min-w-max items-center gap-3 rounded-md px-3 py-2.5 text-sm font-medium transition lg:min-w-0',
-                active ? 'bg-slate-950 text-white' : 'text-slate-600 hover:bg-slate-100 hover:text-slate-950',
+                active
+                  ? 'bg-slate-950 text-white dark:bg-white dark:text-slate-950'
+                  : 'text-slate-600 hover:bg-slate-100 hover:text-slate-950 dark:text-slate-300 dark:hover:bg-white/10 dark:hover:text-white',
               ].join(' ')}
             >
               <Icon size={17} />

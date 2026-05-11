@@ -1,8 +1,9 @@
-import { Outlet } from 'react-router-dom'
+import { Navigate, Outlet, useLocation } from 'react-router-dom'
 import { useEffect, useState } from 'react'
 import Navbar from '../components/Navbar'
 import Sidebar from '../components/Sidebar'
 import { authStorage } from '../services/api'
+import type { AuthSession } from '../services/api'
 import type { User } from '../types/user'
 import type { UserRole } from '../types/user'
 
@@ -11,19 +12,39 @@ interface DashboardLayoutProps {
 }
 
 export default function DashboardLayout({ role }: DashboardLayoutProps) {
-  const [user, setUser] = useState<User | null>(() => authStorage.getSession()?.user ?? null)
+  const location = useLocation()
+  const [session, setSession] = useState<AuthSession | null>(() => authStorage.getSession())
+  const user: User | null = session?.user ?? null
+  const shellWidthClass =
+    role === 'student'
+      ? 'w-full px-4 sm:px-6 lg:px-8 2xl:px-10'
+      : role === 'teacher'
+      ? 'w-full px-4 sm:px-6 lg:px-8 2xl:px-10'
+      : 'container-page'
+  const contentClass =
+    role === 'student' || role === 'teacher'
+      ? `${shellWidthClass} py-6`
+      : `${shellWidthClass} grid gap-6 py-6 lg:grid-cols-[260px_minmax(0,1fr)]`
 
   useEffect(() => {
     return authStorage.subscribe(() => {
-      setUser(authStorage.getSession()?.user ?? null)
+      setSession(authStorage.getSession())
     })
   }, [])
+
+  if (!session) {
+    return <Navigate to="/login" replace state={{ from: location }} />
+  }
+
+  if (session.user.role !== role) {
+    return <Navigate to={session.dashboardPath} replace />
+  }
 
   return (
     <div className="app-shell">
       <Navbar />
-      <div className="container-page grid gap-6 py-6 lg:grid-cols-[260px_minmax(0,1fr)]">
-        <Sidebar role={role} user={user} />
+      <div className={contentClass}>
+        {role === 'student' || role === 'teacher' ? null : <Sidebar role={role} user={user} />}
         <main className="min-w-0">
           <Outlet />
         </main>

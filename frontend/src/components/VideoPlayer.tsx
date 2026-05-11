@@ -17,16 +17,26 @@ export default function VideoPlayer({ lesson, poster, courseTitle }: VideoPlayer
     })
   }, [lesson.id, lesson.videoUrl])
 
+  const showFirstVideoFrame = (event: React.SyntheticEvent<HTMLVideoElement>) => {
+    const video = event.currentTarget
+    setPlaybackError(null)
+
+    if (video.duration > 0.2 && video.currentTime < 0.05) {
+      video.currentTime = 0.1
+    }
+  }
+
   return (
-    <div className="overflow-hidden rounded-lg border border-slate-200 bg-slate-950 shadow-sm">
+    <div className="overflow-hidden rounded-lg border border-slate-800 bg-slate-950 shadow-lg shadow-slate-950/20">
       {lesson.videoUrl ? (
         <>
           <video
             className="aspect-video max-h-[68vh] w-full bg-slate-950 object-contain"
             controls
             playsInline
-            preload="metadata"
+            preload="auto"
             poster={poster}
+            onLoadedMetadata={showFirstVideoFrame}
             onLoadedData={() => setPlaybackError(null)}
             onError={() =>
               setPlaybackError(
@@ -47,9 +57,9 @@ export default function VideoPlayer({ lesson, poster, courseTitle }: VideoPlayer
           ) : null}
         </>
       ) : (
-        <div className="flex aspect-video items-center justify-center bg-slate-950 text-white">
+        <div className="flex aspect-video items-center justify-center bg-[radial-gradient(circle_at_center,#1e293b_0,#020617_60%)] text-white">
           <div className="text-center">
-            <PlayCircle size={54} className="mx-auto mb-3" />
+            <PlayCircle size={54} className="mx-auto mb-3 text-slate-200" />
             <p className="text-sm text-slate-300">วิดีโอบทเรียนพร้อมเชื่อมต่อจาก backend</p>
           </div>
         </div>
