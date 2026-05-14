@@ -24,6 +24,10 @@ export interface Lesson {
   preview: boolean
   videoUrl?: string
   summary: string
+  aiStatus?: 'idle' | 'pending' | 'processing' | 'ready' | 'failed'
+  aiError?: string | null
+  aiSummary?: string | null
+  hasTranscript?: boolean
   quizQuestions: QuizQuestion[]
 }
 
@@ -59,5 +63,6 @@ export interface StudentEnrollment {
   progress: number
   completedLessons: number
   lastLessonId: string | null
+  lastAccessedAt?: string
   joinedAt: string
 }

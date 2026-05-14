@@ -22,6 +22,9 @@ import type { User } from '../types/user'
 
 type AdminSection = 'overview' | 'users' | 'courses'
 
+const fallbackCourseCover =
+  'https://images.unsplash.com/photo-1516321497487-e288fb19713f?auto=format&fit=crop&w=1200&q=80'
+
 const courseStatusLabel: Record<Course['status'], string> = {
   draft: 'ฉบับร่าง',
   published: 'เผยแพร่แล้ว',
@@ -37,6 +40,7 @@ export default function AdminDashboard() {
   const [deleteTarget, setDeleteTarget] = useState<Course | null>(null)
   const [courses, setCourses] = useState<Course[]>([])
   const [popularUpdatingSlug, setPopularUpdatingSlug] = useState<string | null>(null)
+  const [statusUpdatingSlug, setStatusUpdatingSlug] = useState<string | null>(null)
   const [deletingSlug, setDeletingSlug] = useState<string | null>(null)
   const [courseActionError, setCourseActionError] = useState<string | null>(null)
   const [userSearch, setUserSearch] = useState('')
@@ -94,6 +98,21 @@ export default function AdminDashboard() {
   const publishedCourses = courses.filter((course) => course.status === 'published')
   const draftCourses = courses.filter((course) => course.status === 'draft')
   const popularCourses = courses.filter((course) => course.isPopular)
+
+  const updateCourseStatus = async (course: Course, status: Course['status']) => {
+    setStatusUpdatingSlug(course.slug)
+    setCourseActionError(null)
+
+    try {
+      const nextCourse = await api.updateCourseStatus(course.slug, status)
+      setCourses((current) => current.map((item) => (item.slug === nextCourse.slug ? nextCourse : item)))
+      setSelectedCourse((current) => (current?.slug === nextCourse.slug ? nextCourse : current))
+    } catch (currentError) {
+      setCourseActionError(currentError instanceof Error ? currentError.message : 'ไม่สามารถเปลี่ยนสถานะคอร์สได้')
+    } finally {
+      setStatusUpdatingSlug(null)
+    }
+  }
 
   const togglePopular = async (course: Course) => {
     setPopularUpdatingSlug(course.slug)
@@ -302,7 +321,7 @@ export default function AdminDashboard() {
             ) : null}
             {filteredCourses.map((course) => (
               <div key={course.id} className="flex flex-col gap-4 p-5 sm:flex-row sm:items-center">
-                <img src={course.coverImage} alt={course.title} className="h-24 w-full rounded-lg object-cover sm:w-32" />
+                <CourseCoverImage course={course} className="h-24 w-full rounded-lg object-cover sm:w-32" />
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <p className="font-semibold text-slate-950">{course.title}</p>
@@ -322,6 +341,27 @@ export default function AdminDashboard() {
                   </p>
                 </div>
                 <div className="flex flex-wrap gap-2">
+                  {course.status !== 'published' ? (
+                    <button
+                      type="button"
+                      className="btn-primary w-fit px-3 py-2"
+                      onClick={() => updateCourseStatus(course, 'published')}
+                      disabled={statusUpdatingSlug === course.slug}
+                    >
+                      {statusUpdatingSlug === course.slug ? <LoaderCircle size={15} className="animate-spin" /> : <ShieldCheck size={15} />}
+                      อนุมัติเผยแพร่
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="btn-secondary w-fit px-3 py-2"
+                      onClick={() => updateCourseStatus(course, 'hidden')}
+                      disabled={statusUpdatingSlug === course.slug}
+                    >
+                      {statusUpdatingSlug === course.slug ? <LoaderCircle size={15} className="animate-spin" /> : <Eye size={15} />}
+                      ซ่อนคอร์ส
+                    </button>
+                  )}
                   <button
                     type="button"
                     className={course.isPopular ? 'btn-primary w-fit px-3 py-2' : 'btn-secondary w-fit px-3 py-2'}
@@ -477,7 +517,7 @@ function CourseInspectionModal({ course, onClose }: { course: Course; onClose: (
   return (
     <ModalShell title={course.title} eyebrow="Course Inspection" onClose={onClose}>
       <div className="grid gap-5 md:grid-cols-[240px_minmax(0,1fr)]">
-        <img src={course.coverImage} alt={course.title} className="aspect-video w-full rounded-lg object-cover" />
+        <CourseCoverImage course={course} className="aspect-video w-full rounded-lg object-cover" />
         <div className="grid gap-4 sm:grid-cols-2">
           <InfoTile label="ผู้สอน" value={course.instructor.name} />
           <InfoTile label="สถานะ" value={courseStatusLabel[course.status]} />
@@ -488,6 +528,26 @@ function CourseInspectionModal({ course, onClose }: { course: Course; onClose: (
         </div>
       </div>
     </ModalShell>
+  )
+}
+
+function CourseCoverImage({ course, className }: { course: Course; className: string }) {
+  const [src, setSrc] = useState(course.coverImage || fallbackCourseCover)
+
+  useEffect(() => {
+    setSrc(course.coverImage || fallbackCourseCover)
+  }, [course.coverImage])
+
+  return (
+    <img
+      src={src}
+      alt={course.title}
+      className={className}
+      loading="lazy"
+      onError={() => {
+        if (src !== fallbackCourseCover) setSrc(fallbackCourseCover)
+      }}
+    />
   )
 }
 

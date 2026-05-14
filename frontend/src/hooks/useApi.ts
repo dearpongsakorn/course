@@ -1,9 +1,9 @@
 import { useEffect, useState, type DependencyList } from 'react'
 
-export function useApi<T>(loader: () => Promise<T>, dependencies: DependencyList = []) {
-  const [data, setData] = useState<T | null>(null)
+export function useApi<T>(loader: () => Promise<T>, dependencies: DependencyList = [], initialData: T | null = null) {
+  const [data, setData] = useState<T | null>(initialData)
   const [error, setError] = useState<string | null>(null)
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(!initialData)
 
   useEffect(() => {
     let active = true

@@ -15,16 +15,7 @@ export default function DashboardLayout({ role }: DashboardLayoutProps) {
   const location = useLocation()
   const [session, setSession] = useState<AuthSession | null>(() => authStorage.getSession())
   const user: User | null = session?.user ?? null
-  const shellWidthClass =
-    role === 'student'
-      ? 'w-full px-4 sm:px-6 lg:px-8 2xl:px-10'
-      : role === 'teacher'
-      ? 'w-full px-4 sm:px-6 lg:px-8 2xl:px-10'
-      : 'container-page'
-  const contentClass =
-    role === 'student' || role === 'teacher'
-      ? `${shellWidthClass} py-6`
-      : `${shellWidthClass} grid gap-6 py-6 lg:grid-cols-[260px_minmax(0,1fr)]`
+  const contentClass = 'container-page grid gap-6 py-6 lg:grid-cols-[260px_minmax(0,1fr)]'
 
   useEffect(() => {
     return authStorage.subscribe(() => {
@@ -40,11 +31,19 @@ export default function DashboardLayout({ role }: DashboardLayoutProps) {
     return <Navigate to={session.dashboardPath} replace />
   }
 
+  if (role === 'student' || role === 'teacher') {
+    return (
+      <div className="min-h-screen bg-white text-black">
+        <Outlet />
+      </div>
+    )
+  }
+
   return (
     <div className="app-shell">
       <Navbar />
       <div className={contentClass}>
-        {role === 'student' || role === 'teacher' ? null : <Sidebar role={role} user={user} />}
+        <Sidebar role={role} user={user} />
         <main className="min-w-0">
           <Outlet />
         </main>

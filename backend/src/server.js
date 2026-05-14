@@ -3,7 +3,8 @@ import http from 'node:http'
 import { spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import path from 'node:path'
-import { createReadStream } from 'node:fs'
+import { createReadStream, createWriteStream } from 'node:fs'
+import { pipeline } from 'node:stream/promises'
 import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { GoogleGenAI } from '@google/genai'
@@ -16,6 +17,15 @@ const aiModel = process.env.AI_MODEL ?? 'not-configured'
 const transcribeModel = process.env.TRANSCRIBE_MODEL ?? aiModel
 const geminiApiKey = process.env.GEMINI_API_KEY ?? ''
 const ffmpegBinary = process.env.FFMPEG_PATH ?? 'ffmpeg'
+const transcodeUploadedVideos = process.env.TRANSCODE_UPLOADED_VIDEOS === 'true'
+const validateUploadedVideos = process.env.VALIDATE_UPLOADED_VIDEOS === 'true'
+const normalizeExistingUploads = process.env.NORMALIZE_EXISTING_UPLOADS === 'true'
+const autoTranscribeLessons = process.env.AUTO_TRANSCRIBE_LESSONS === 'true'
+const maxAutoTranscribeVideoBytes = Number(process.env.MAX_AUTO_TRANSCRIBE_VIDEO_MB ?? 100) * 1024 * 1024
+const muxAudioWaitSeconds = Math.max(30, Number(process.env.MUX_AUDIO_WAIT_SECONDS ?? 1800) || 1800)
+const muxAudioDownloadMaxBytes = Number(process.env.MUX_AUDIO_DOWNLOAD_MAX_MB ?? 1024) * 1024 * 1024
+const transcriptionChunkSeconds = Math.max(60, Number(process.env.TRANSCRIPTION_CHUNK_SECONDS ?? 600) || 600)
+const ffmpegThreads = Math.max(1, Number(process.env.FFMPEG_THREADS ?? 2) || 2)
 const adminEmail = (process.env.ADMIN_EMAIL ?? 'admin@example.com').trim().toLowerCase()
 const adminPassword = process.env.ADMIN_PASSWORD ?? 'Admin12345'
 const studentEmail = (process.env.STUDENT_EMAIL ?? 'mintra@example.com').trim().toLowerCase()
@@ -32,6 +42,18 @@ const r2Bucket = process.env.R2_BUCKET ?? ''
 const r2AccessKeyId = process.env.R2_ACCESS_KEY_ID ?? ''
 const r2SecretAccessKey = process.env.R2_SECRET_ACCESS_KEY ?? ''
 const r2PublicBaseUrl = (process.env.R2_PUBLIC_BASE_URL ?? '').replace(/\/+$/g, '')
+const muxTokenId = process.env.MUX_TOKEN_ID ?? ''
+const muxTokenSecret = process.env.MUX_TOKEN_SECRET ?? ''
+const muxCorsOrigin =
+  (process.env.MUX_CORS_ORIGIN ?? (frontendOrigin === '*' ? 'http://localhost:5173' : frontendOrigin)).trim() ||
+  'http://localhost:5173'
+const muxVideoQuality = process.env.MUX_VIDEO_QUALITY ?? 'basic'
+const muxUploadTimeoutSeconds = Math.min(
+  604800,
+  Math.max(60, Number(process.env.MUX_UPLOAD_TIMEOUT_SECONDS ?? 3600) || 3600),
+)
+const muxTestUploads = process.env.MUX_TEST_UPLOADS === 'true'
+const muxUploadEnabled = Boolean(muxTokenId && muxTokenSecret)
 const r2StorageEnabled = Boolean(
   r2Bucket &&
     r2AccessKeyId &&
@@ -54,7 +76,7 @@ const sendJson = (response, statusCode, payload) => {
   response.writeHead(statusCode, {
     'Access-Control-Allow-Origin': frontendOrigin,
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+    'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-File-Name',
     'Content-Type': 'application/json; charset=utf-8',
   })
   response.end(JSON.stringify(payload))
@@ -253,6 +275,30 @@ const ensureCourseSchema = async () => {
     SET status = 'published'
     WHERE status IS NULL OR status = ''
   `)
+
+  await query(`
+    ALTER TABLE lessons
+    ADD COLUMN IF NOT EXISTS ai_status TEXT NOT NULL DEFAULT 'idle'
+  `)
+
+  await query(`
+    ALTER TABLE lessons
+    ADD COLUMN IF NOT EXISTS ai_error TEXT
+  `)
+
+  await query(`
+    ALTER TABLE enrollments
+    ADD COLUMN IF NOT EXISTS last_accessed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `)
+
+  await query(`
+    UPDATE lessons
+    SET ai_status = CASE
+      WHEN video_url IS NULL OR video_url = '' THEN 'idle'
+      WHEN ai_status IS NULL OR ai_status = '' THEN 'pending'
+      ELSE ai_status
+    END
+  `)
 }
 
 const getLessonContent = async (lessonId) => {
@@ -261,6 +307,7 @@ const getLessonContent = async (lessonId) => {
       SELECT
         l.id,
         l.title,
+        l.duration,
         l.summary,
         COALESCE(t.transcript, l.summary) AS content,
         t.transcript AS transcript,
@@ -313,7 +360,7 @@ const callGemini = async (prompt, { json = false } = {}) => {
       model: aiModel,
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       config: {
-        temperature: 0.2,
+        temperature: json ? 0.2 : 0.55,
         ...(json ? { responseMimeType: 'application/json' } : {}),
       },
     })
@@ -355,6 +402,35 @@ const parseJsonResponse = (text) => {
     if (!match) throw new Error('AI did not return valid JSON')
     return JSON.parse(match[0])
   }
+}
+
+const isLessonRelatedQuestion = (question, lessonTitle = '') => {
+  const normalizedQuestion = String(question ?? '').toLowerCase()
+  const normalizedTitle = String(lessonTitle ?? '').toLowerCase()
+  const lessonSignals = [
+    'บทเรียน',
+    'บทนี้',
+    'ในบท',
+    'คอร์ส',
+    'คลิป',
+    'วิดีโอ',
+    'เนื้อหา',
+    'ที่เรียน',
+    'จากบท',
+    'ในบทนี้',
+    'สรุปบท',
+    'transcript',
+    'lesson',
+    'course',
+    'video',
+  ]
+
+  if (lessonSignals.some((signal) => normalizedQuestion.includes(signal))) return true
+
+  return normalizedTitle
+    .split(/\s+/)
+    .filter((word) => word.length >= 4)
+    .some((word) => normalizedQuestion.includes(word))
 }
 
 const saveAiOutput = async ({ lessonId, outputType, prompt, result }) => {
@@ -658,6 +734,8 @@ const transcodeVideoToMp4 = async (inputPath, outputPath) =>
         'aac',
         '-b:a',
         '128k',
+        '-threads',
+        String(ffmpegThreads),
         '-movflags',
         '+faststart',
         outputPath,
@@ -694,6 +772,71 @@ const transcodeVideoToMp4 = async (inputPath, outputPath) =>
       reject(transcodeError)
     })
   })
+
+const splitAudioForTranscription = async (inputPath, chunkSeconds = transcriptionChunkSeconds) => {
+  const fileInfo = await stat(inputPath)
+
+  if (fileInfo.size <= maxAutoTranscribeVideoBytes) {
+    return [inputPath]
+  }
+
+  await ensureUploadsDir()
+  const chunkDir = path.join(uploadsTempDir, `chunks-${crypto.randomUUID()}`)
+  await mkdir(chunkDir, { recursive: true })
+  const outputPattern = path.join(chunkDir, 'chunk-%03d.m4a')
+
+  await new Promise((resolve, reject) => {
+    const ffmpeg = spawn(
+      ffmpegBinary,
+      [
+        '-y',
+        '-i',
+        inputPath,
+        '-vn',
+        '-ac',
+        '1',
+        '-ar',
+        '16000',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '64k',
+        '-f',
+        'segment',
+        '-segment_time',
+        String(chunkSeconds),
+        '-reset_timestamps',
+        '1',
+        outputPattern,
+      ],
+      { stdio: ['ignore', 'ignore', 'pipe'] },
+    )
+
+    let errorOutput = ''
+    ffmpeg.stderr.on('data', (chunk) => {
+      errorOutput += String(chunk)
+    })
+    ffmpeg.on('error', reject)
+    ffmpeg.on('close', (code) => {
+      if (code === 0) {
+        resolve(undefined)
+        return
+      }
+
+      reject(new Error(`ไม่สามารถแบ่งไฟล์เสียงสำหรับ AI ได้${errorOutput ? `: ${errorOutput.trim()}` : ''}`))
+    })
+  })
+
+  const { readdir } = await import('node:fs/promises')
+  const chunkFiles = (await readdir(chunkDir))
+    .filter((fileName) => fileName.endsWith('.m4a'))
+    .sort()
+    .map((fileName) => path.join(chunkDir, fileName))
+
+  if (!chunkFiles.length) throw new Error('ไม่พบไฟล์เสียงที่แบ่งสำหรับ AI')
+
+  return chunkFiles
+}
 
 const probeVideoStreams = async (absolutePath) =>
   new Promise((resolve, reject) => {
@@ -783,6 +926,72 @@ const downloadRemoteFile = async (fileUrl) => {
   return tempPath
 }
 
+const downloadRemoteFileWithLimit = async (fileUrl, { maxBytes = maxAutoTranscribeVideoBytes } = {}) => {
+  await ensureUploadsDir()
+
+  const response = await fetch(fileUrl)
+
+  if (!response.ok) {
+    throw new Error(`Cannot download remote video (${response.status})`)
+  }
+
+  const contentLength = Number(response.headers.get('content-length') ?? 0)
+  if (contentLength && contentLength > maxBytes) {
+    throw new Error(`Remote video is larger than ${Math.round(maxBytes / 1024 / 1024)}MB`)
+  }
+
+  const bytes = Buffer.from(await response.arrayBuffer())
+  if (bytes.byteLength > maxBytes) {
+    throw new Error(`Remote video is larger than ${Math.round(maxBytes / 1024 / 1024)}MB`)
+  }
+
+  const extension = path.extname(new URL(fileUrl).pathname) || '.mp4'
+  const tempPath = path.join(uploadsTempDir, `remote-${crypto.randomUUID()}${extension}`)
+  await writeFile(tempPath, bytes)
+
+  return tempPath
+}
+
+const downloadRemoteFileStreamWithLimit = async (fileUrl, { maxBytes, extension: forcedExtension } = {}) => {
+  await ensureUploadsDir()
+
+  const response = await fetch(fileUrl)
+
+  if (!response.ok || !response.body) {
+    throw new Error(`Cannot download remote media (${response.status})`)
+  }
+
+  const contentLength = Number(response.headers.get('content-length') ?? 0)
+  if (contentLength && maxBytes && contentLength > maxBytes) {
+    throw new Error(`Remote media is larger than ${Math.round(maxBytes / 1024 / 1024)}MB`)
+  }
+
+  const extension = forcedExtension || path.extname(new URL(fileUrl).pathname) || '.m4a'
+  const tempPath = path.join(uploadsTempDir, `remote-${crypto.randomUUID()}${extension}`)
+  let downloadedBytes = 0
+
+  const limitedStream = new TransformStream({
+    transform(chunk, controller) {
+      downloadedBytes += chunk.byteLength
+
+      if (maxBytes && downloadedBytes > maxBytes) {
+        controller.error(new Error(`Remote media is larger than ${Math.round(maxBytes / 1024 / 1024)}MB`))
+        return
+      }
+
+      controller.enqueue(chunk)
+    },
+  })
+
+  try {
+    await pipeline(response.body.pipeThrough(limitedStream), createWriteStream(tempPath))
+    return tempPath
+  } catch (error) {
+    await unlink(tempPath).catch(() => {})
+    throw error
+  }
+}
+
 const mimeTypeForFile = (absolutePath) => {
   const extension = path.extname(absolutePath).toLowerCase()
   const mimeTypes = {
@@ -838,6 +1047,27 @@ const transcribeVideoWithGemini = async (absolutePath) => {
   return transcript
 }
 
+const transcribeMediaWithGemini = async (absolutePath) => {
+  const chunkPaths = await splitAudioForTranscription(absolutePath)
+  const temporaryChunks = chunkPaths.filter((chunkPath) => chunkPath !== absolutePath)
+  const transcripts = []
+
+  try {
+    for (let index = 0; index < chunkPaths.length; index += 1) {
+      const chunkTranscript = await transcribeVideoWithGemini(chunkPaths[index])
+      transcripts.push(
+        chunkPaths.length > 1
+          ? `ช่วงที่ ${index + 1}\n${chunkTranscript.trim()}`
+          : chunkTranscript.trim(),
+      )
+    }
+  } finally {
+    await Promise.all(temporaryChunks.map((chunkPath) => unlink(chunkPath).catch(() => {})))
+  }
+
+  return transcripts.filter(Boolean).join('\n\n').trim()
+}
+
 const saveLessonTranscript = async (lessonId, transcript, source = 'manual') => {
   if (!transcript.trim()) return
 
@@ -853,9 +1083,21 @@ const saveLessonTranscript = async (lessonId, transcript, source = 'manual') => 
   )
 }
 
+const updateLessonAiStatus = async (lessonId, status, errorMessage = null) => {
+  await query(
+    `
+      UPDATE lessons
+      SET ai_status = $1, ai_error = $2
+      WHERE id = $3
+    `,
+    [status, errorMessage, lessonId],
+  )
+}
+
 const autoTranscribeLesson = async (lessonId, videoUrl) => {
   if (aiProvider !== 'gemini') {
     console.warn(`Skip transcript for lesson ${lessonId}: AI_PROVIDER is not gemini`)
+    await updateLessonAiStatus(lessonId, 'failed', 'AI_PROVIDER is not gemini')
     return
   }
 
@@ -863,19 +1105,35 @@ const autoTranscribeLesson = async (lessonId, videoUrl) => {
   let shouldDeleteTempFile = false
 
   try {
-    if (!absolutePath && isRemoteHttpUrl(videoUrl)) {
-      absolutePath = await downloadRemoteFile(videoUrl)
+    await updateLessonAiStatus(lessonId, 'processing', null)
+
+    if (!absolutePath && isMuxVideoUrl(videoUrl)) {
+      absolutePath = await downloadMuxPlaybackForGemini(videoUrl)
+      shouldDeleteTempFile = Boolean(absolutePath)
+    } else if (!absolutePath && isRemoteHttpUrl(videoUrl)) {
+      absolutePath = await downloadRemoteFileStreamWithLimit(videoUrl, {
+        maxBytes: muxAudioDownloadMaxBytes,
+        extension: path.extname(new URL(videoUrl).pathname) || '.mp4',
+      })
       shouldDeleteTempFile = true
     }
 
-    if (!absolutePath) return
+    if (!absolutePath) {
+      await updateLessonAiStatus(lessonId, 'failed', 'ไม่พบไฟล์วิดีโอสำหรับถอดสคริปต์')
+      return
+    }
 
-    await stat(absolutePath)
-    const transcript = await transcribeVideoWithGemini(absolutePath)
+    const transcript = await transcribeMediaWithGemini(absolutePath)
     await saveLessonTranscript(lessonId, transcript, 'gemini')
+    await updateLessonAiStatus(lessonId, 'ready', null)
     console.log(`Generated Gemini transcript for lesson ${lessonId}`)
   } catch (error) {
     console.error(`Failed to generate Gemini transcript for lesson ${lessonId}`, error)
+    await updateLessonAiStatus(
+      lessonId,
+      'failed',
+      error instanceof Error ? error.message : 'AI transcription failed',
+    )
   } finally {
     if (shouldDeleteTempFile && absolutePath) {
       await unlink(absolutePath).catch(() => {})
@@ -885,6 +1143,11 @@ const autoTranscribeLesson = async (lessonId, videoUrl) => {
 
 const queueAutoTranscribeLesson = (lessonId, videoUrl) => {
   if (!videoUrl) return
+  if (!autoTranscribeLessons) return
+
+  updateLessonAiStatus(lessonId, 'pending', null).catch((error) => {
+    console.error(`Failed to mark transcript pending for lesson ${lessonId}`, error)
+  })
 
   setTimeout(() => {
     autoTranscribeLesson(lessonId, videoUrl).catch((error) => {
@@ -1037,6 +1300,160 @@ const parseMultipartFormData = (contentType, buffer) => {
   return { fields, filePart }
 }
 
+const writeRequestBodyToFile = async (request, absolutePath, maxBytes = maxVideoUploadBytes) =>
+  new Promise((resolve, reject) => {
+    const output = createWriteStream(absolutePath)
+    let totalBytes = 0
+    let settled = false
+
+    const finishWithError = (error) => {
+      if (settled) return
+      settled = true
+      output.destroy()
+      request.destroy()
+      reject(error)
+    }
+
+    output.on('error', finishWithError)
+    output.on('drain', () => request.resume())
+    output.on('finish', () => {
+      if (settled) return
+      settled = true
+      resolve(totalBytes)
+    })
+
+    request.on('data', (chunk) => {
+      totalBytes += chunk.length
+
+      if (totalBytes > maxBytes) {
+        const error = new Error(`วิดีโอต้องไม่เกิน ${Math.round(maxVideoUploadBytes / 1024 / 1024)}MB`)
+        error.statusCode = 413
+        finishWithError(error)
+        return
+      }
+
+      if (!output.write(chunk)) request.pause()
+    })
+    request.on('end', () => output.end())
+    request.on('error', finishWithError)
+    request.on('aborted', () => {
+      const error = new Error('การอัปโหลดถูกยกเลิก')
+      error.statusCode = 499
+      finishWithError(error)
+    })
+  })
+
+const persistUploadedVideoPath = async ({ fileName, mimeType, absolutePath, size }) => {
+  if (mimeType !== 'video/mp4') {
+    await unlink(absolutePath).catch(() => {})
+    return { statusCode: 400, payload: { message: 'รองรับวิดีโอ MP4 เท่านั้น' } }
+  }
+
+  if (size > maxVideoUploadBytes) {
+    await unlink(absolutePath).catch(() => {})
+    return {
+      statusCode: 400,
+      payload: { message: `วิดีโอต้องไม่เกิน ${Math.round(maxVideoUploadBytes / 1024 / 1024)}MB` },
+    }
+  }
+
+  const safeBaseName = path
+    .basename(fileName)
+    .toLowerCase()
+    .replace(/[^a-z0-9.-]+/g, '-')
+    .replace(/^-|-$/g, '')
+  const extension = path.extname(safeBaseName) || '.mp4'
+  const outputFileName = `video-${Date.now()}-${crypto.randomUUID()}.mp4`
+  const outputPath = path.join(r2StorageEnabled ? uploadsTempDir : uploadsDir, outputFileName)
+  let tempInputPath = absolutePath
+  let storedVideoPath = absolutePath
+
+  try {
+    if (transcodeUploadedVideos) {
+      let canReuseOriginal = false
+
+      try {
+        canReuseOriginal = isBrowserFriendlyMp4(await probeVideoStreams(tempInputPath))
+      } catch (error) {
+        console.warn('Could not inspect uploaded video codec, transcoding instead', error)
+      }
+
+      if (canReuseOriginal) {
+        storedVideoPath = tempInputPath
+      } else {
+        await transcodeVideoToMp4(tempInputPath, outputPath)
+        storedVideoPath = outputPath
+      }
+    }
+
+    if (validateUploadedVideos) {
+      try {
+        const finalStreams = await probeVideoStreams(storedVideoPath)
+        const videoStream = finalStreams.find((stream) => stream.codec_type === 'video')
+
+        if (!videoStream || !isBrowserFriendlyMp4(finalStreams)) {
+          throw new Error('ไม่พบ video stream')
+        }
+      } catch (error) {
+        const invalidVideoError = new Error(
+          'ไฟล์วิดีโอไม่สมบูรณ์หรือ browser อ่านภาพไม่ได้ กรุณา export เป็น MP4 แบบ H.264/AAC แล้วอัปโหลดใหม่',
+        )
+        invalidVideoError.statusCode = 400
+        throw invalidVideoError
+      }
+    }
+
+    if (r2StorageEnabled) {
+      try {
+        const uploadedUrl = await putObjectToR2({
+          key: `videos/${outputFileName}`,
+          contentType: 'video/mp4',
+          body: await readFile(storedVideoPath),
+        })
+
+        return {
+          statusCode: 201,
+          payload: {
+            data: {
+              kind: 'video',
+              fileName: outputFileName,
+              fileUrl: uploadedUrl,
+              storage: 'r2',
+            },
+          },
+        }
+      } finally {
+        await unlink(storedVideoPath).catch(() => {})
+      }
+    }
+
+    if (storedVideoPath !== outputPath) {
+      await rename(storedVideoPath, outputPath)
+      tempInputPath = ''
+      storedVideoPath = outputPath
+    }
+
+    return {
+      statusCode: 201,
+      payload: {
+        data: {
+          kind: 'video',
+          fileName: outputFileName,
+          fileUrl: `/uploads/${outputFileName}`,
+          storage: 'local',
+        },
+      },
+    }
+  } finally {
+    if (tempInputPath) {
+      await unlink(tempInputPath).catch(() => {})
+    }
+    if (storedVideoPath !== outputPath && storedVideoPath !== tempInputPath) {
+      await unlink(storedVideoPath).catch(() => {})
+    }
+  }
+}
+
 const persistUploadedFile = async ({ kind, fileName, mimeType, buffer }) => {
   const allowedTypes =
     kind === 'video'
@@ -1084,12 +1501,14 @@ const persistUploadedFile = async ({ kind, fileName, mimeType, buffer }) => {
     await writeFile(tempInputPath, buffer)
 
     try {
-      let canReuseOriginal = false
+      let canReuseOriginal = !transcodeUploadedVideos
 
-      try {
-        canReuseOriginal = isBrowserFriendlyMp4(await probeVideoStreams(tempInputPath))
-      } catch (error) {
-        console.warn('Could not inspect uploaded video codec, transcoding instead', error)
+      if (transcodeUploadedVideos) {
+        try {
+          canReuseOriginal = isBrowserFriendlyMp4(await probeVideoStreams(tempInputPath))
+        } catch (error) {
+          console.warn('Could not inspect uploaded video codec, transcoding instead', error)
+        }
       }
 
       if (canReuseOriginal) {
@@ -1112,7 +1531,7 @@ const persistUploadedFile = async ({ kind, fileName, mimeType, buffer }) => {
       const finalStreams = await probeVideoStreams(storedVideoPath)
       const videoStream = finalStreams.find((stream) => stream.codec_type === 'video')
 
-      if (!videoStream) {
+      if (!videoStream || !isBrowserFriendlyMp4(finalStreams)) {
         throw new Error('ไม่พบ video stream')
       }
     } catch (error) {
@@ -1214,6 +1633,15 @@ const saveUploadAsset = async (request) => {
   }
 
   if (contentType.includes('multipart/form-data')) {
+    if (contentLength > maxImageUploadBytes + 1024 * 1024) {
+      return {
+        statusCode: 400,
+        payload: {
+          message: 'กรุณารีเฟรชหน้าเว็บแล้วอัปโหลดวิดีโอใหม่ ระบบจะใช้โหมดอัปโหลดไฟล์ใหญ่ที่ไม่กิน RAM',
+        },
+      }
+    }
+
     const rawBody = await readRawBody(request)
     const { fields, filePart } = parseMultipartFormData(contentType, rawBody)
     const kind = String(fields.kind ?? '').trim()
@@ -1251,6 +1679,51 @@ const saveUploadAsset = async (request) => {
   return persistUploadedFile({ kind, fileName, mimeType, buffer })
 }
 
+const saveVideoUploadStream = async (request) => {
+  const authUser = await getAuthUser(request)
+
+  if (!authUser) {
+    return { statusCode: 401, payload: { message: 'กรุณาเข้าสู่ระบบก่อนอัปโหลดไฟล์' } }
+  }
+
+  if (!['teacher', 'admin'].includes(authUser.role)) {
+    return { statusCode: 403, payload: { message: 'บัญชีนี้ไม่มีสิทธิ์อัปโหลดไฟล์คอร์ส' } }
+  }
+
+  const contentType = String(request.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase()
+  const contentLength = Number(request.headers['content-length'] ?? 0)
+
+  if (contentLength > maxVideoUploadBytes) {
+    return {
+      statusCode: 413,
+      payload: { message: `วิดีโอต้องไม่เกิน ${Math.round(maxVideoUploadBytes / 1024 / 1024)}MB` },
+    }
+  }
+
+  if (contentType !== 'video/mp4') {
+    return { statusCode: 400, payload: { message: 'รองรับวิดีโอ MP4 เท่านั้น' } }
+  }
+
+  await ensureUploadsDir()
+
+  const fileName = decodeURIComponent(String(request.headers['x-file-name'] ?? 'video.mp4')).trim() || 'video.mp4'
+  const tempPath = path.join(uploadsTempDir, `stream-${crypto.randomUUID()}.mp4`)
+
+  try {
+    const size = await writeRequestBodyToFile(request, tempPath, maxVideoUploadBytes)
+
+    return persistUploadedVideoPath({
+      fileName,
+      mimeType: contentType,
+      absolutePath: tempPath,
+      size,
+    })
+  } catch (error) {
+    await unlink(tempPath).catch(() => {})
+    throw error
+  }
+}
+
 const authorizeCourseAssetUpload = async (request) => {
   const authUser = await getAuthUser(request)
 
@@ -1269,6 +1742,139 @@ const authorizeCourseAssetUpload = async (request) => {
   }
 
   return { authUser, error: null }
+}
+
+const muxRequest = async (pathName, { method = 'GET', body } = {}) => {
+  if (!muxUploadEnabled) {
+    const error = new Error('ยังไม่ได้ตั้งค่า MUX_TOKEN_ID และ MUX_TOKEN_SECRET ใน backend/.env')
+    error.statusCode = 501
+    throw error
+  }
+
+  const response = await fetch(`https://api.mux.com/video/v1${pathName}`, {
+    method,
+    headers: {
+      Authorization: `Basic ${Buffer.from(`${muxTokenId}:${muxTokenSecret}`).toString('base64')}`,
+      'Content-Type': 'application/json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  })
+
+  const payload = await response.json().catch(() => ({}))
+
+  if (!response.ok) {
+    const messages = payload.error?.messages
+    const message = Array.isArray(messages)
+      ? messages.join(', ')
+      : payload.error?.message || payload.message || 'Mux API request failed'
+    const error = new Error(message)
+    error.statusCode = response.status
+    throw error
+  }
+
+  return payload.data
+}
+
+const createMuxDirectUpload = async (request) => {
+  const { error } = await authorizeCourseAssetUpload(request)
+  if (error) return error
+
+  const body = await readBody(request)
+  const fileName = String(body.fileName ?? 'lesson-video').trim() || 'lesson-video'
+  const fileSize = Number(body.fileSize ?? 0)
+
+  if (!Number.isFinite(fileSize) || fileSize <= 0) {
+    return { statusCode: 400, payload: { message: 'ข้อมูลวิดีโอไม่ครบ' } }
+  }
+
+  if (fileSize > maxVideoUploadBytes) {
+    return {
+      statusCode: 413,
+      payload: { message: `วิดีโอต้องไม่เกิน ${Math.round(maxVideoUploadBytes / 1024 / 1024)}MB` },
+    }
+  }
+
+  try {
+    const upload = await muxRequest('/uploads', {
+      method: 'POST',
+      body: {
+        cors_origin: muxCorsOrigin,
+        timeout: muxUploadTimeoutSeconds,
+        test: muxTestUploads,
+        new_asset_settings: {
+          playback_policies: ['public'],
+          video_quality: muxVideoQuality,
+          static_renditions: [
+            {
+              resolution: 'audio-only',
+            },
+          ],
+          meta: {
+            title: fileName,
+          },
+        },
+      },
+    })
+
+    return {
+      statusCode: 201,
+      payload: {
+        data: {
+          provider: 'mux',
+          uploadId: upload.id,
+          uploadUrl: upload.url,
+          timeout: upload.timeout,
+          status: upload.status,
+        },
+      },
+    }
+  } catch (currentError) {
+    return {
+      statusCode: currentError.statusCode ?? 502,
+      payload: { message: currentError.message },
+    }
+  }
+}
+
+const getMuxDirectUploadStatus = async (request, uploadId) => {
+  const { error } = await authorizeCourseAssetUpload(request)
+  if (error) return error
+
+  if (!uploadId || !/^[a-zA-Z0-9_-]+$/.test(uploadId)) {
+    return { statusCode: 400, payload: { message: 'Mux upload id ไม่ถูกต้อง' } }
+  }
+
+  try {
+    const upload = await muxRequest(`/uploads/${encodeURIComponent(uploadId)}`)
+    let asset = null
+    let playbackId = null
+
+    if (upload.asset_id) {
+      asset = await muxRequest(`/assets/${encodeURIComponent(upload.asset_id)}`)
+      playbackId = asset.playback_ids?.find((item) => item.policy === 'public')?.id ?? asset.playback_ids?.[0]?.id ?? null
+    }
+
+    return {
+      statusCode: 200,
+      payload: {
+        data: {
+          provider: 'mux',
+          uploadId: upload.id,
+          status: upload.status,
+          assetId: upload.asset_id ?? undefined,
+          assetStatus: asset?.status ?? undefined,
+          playbackId: playbackId ?? undefined,
+          playbackUrl: playbackId ? `https://player.mux.com/${playbackId}` : undefined,
+          error: upload.error?.message ?? asset?.errors?.messages?.join(', ') ?? undefined,
+        },
+      },
+    }
+  } catch (currentError) {
+    return {
+      statusCode: currentError.statusCode ?? 502,
+      payload: { message: currentError.message },
+    }
+  }
 }
 
 const isSafeR2VideoKey = (key) => /^videos\/video-\d+-[0-9a-f-]+\.mp4$/i.test(key)
@@ -1434,6 +2040,56 @@ const cancelR2MultipartVideoUpload = async (request) => {
   return { statusCode: 200, payload: { data: { ok: true } } }
 }
 
+const inspectUploadedVideo = async (request, url) => {
+  const { error } = await authorizeCourseAssetUpload(request)
+  if (error) return error
+
+  const fileUrl = String(url.searchParams.get('fileUrl') ?? '').trim()
+  const absolutePath = getLocalUploadPath(fileUrl)
+
+  if (!fileUrl || !absolutePath) {
+    return { statusCode: 400, payload: { message: 'fileUrl ไม่ถูกต้อง' } }
+  }
+
+  try {
+    await stat(absolutePath)
+  } catch {
+    return { statusCode: 404, payload: { message: 'ไม่พบไฟล์วิดีโอ' } }
+  }
+
+  try {
+    const streams = await probeVideoStreams(absolutePath)
+    const videoStream = streams.find((stream) => stream.codec_type === 'video')
+    const audioStream = streams.find((stream) => stream.codec_type === 'audio')
+
+    return {
+      statusCode: 200,
+      payload: {
+        data: {
+          fileUrl,
+          exists: true,
+          isBrowserFriendly: isBrowserFriendlyMp4(streams),
+          videoCodec: String(videoStream?.codec_name ?? '').toLowerCase() || null,
+          audioCodec: String(audioStream?.codec_name ?? '').toLowerCase() || null,
+        },
+      },
+    }
+  } catch {
+    return {
+      statusCode: 200,
+      payload: {
+        data: {
+          fileUrl,
+          exists: true,
+          isBrowserFriendly: false,
+          videoCodec: null,
+          audioCodec: null,
+        },
+      },
+    }
+  }
+}
+
 const saveTranscript = async (request, lessonId) => {
   const body = await readBody(request)
   const transcript = String(body.transcript ?? '').trim()
@@ -1447,6 +2103,213 @@ const saveTranscript = async (request, lessonId) => {
   return { statusCode: 200, payload: { data: { lessonId, transcript } } }
 }
 
+const getManageableLesson = async (request, lessonId) => {
+  const authUser = await getAuthUser(request)
+
+  if (!authUser) {
+    return {
+      lesson: null,
+      error: { statusCode: 401, payload: { message: 'Unauthorized' } },
+    }
+  }
+
+  const result = await query(
+    `
+      SELECT l.id, l.title, l.video_url AS "videoUrl", c.teacher_id AS "teacherId"
+      FROM lessons l
+      JOIN courses c ON c.id = l.course_id
+      WHERE l.id = $1
+      LIMIT 1
+    `,
+    [lessonId],
+  )
+  const lesson = result.rows[0] ?? null
+
+  if (!lesson) {
+    return {
+      lesson: null,
+      error: { statusCode: 404, payload: { message: 'Lesson not found' } },
+    }
+  }
+
+  if (authUser.role !== 'admin' && lesson.teacherId !== authUser.id) {
+    return {
+      lesson: null,
+      error: { statusCode: 403, payload: { message: 'Forbidden' } },
+    }
+  }
+
+  return { lesson, error: null }
+}
+
+const getAiAccessibleLesson = async (request, lessonId) => {
+  const authUser = await getAuthUser(request)
+
+  if (!authUser) {
+    return {
+      lesson: null,
+      error: { statusCode: 401, payload: { message: 'Unauthorized' } },
+    }
+  }
+
+  const result = await query(
+    `
+      SELECT
+        l.id,
+        l.title,
+        l.video_url AS "videoUrl",
+        c.id AS "courseId",
+        c.teacher_id AS "teacherId",
+        e.student_id AS "enrolledStudentId"
+      FROM lessons l
+      JOIN courses c ON c.id = l.course_id
+      LEFT JOIN enrollments e ON e.course_id = c.id AND e.student_id = $2
+      WHERE l.id = $1
+      LIMIT 1
+    `,
+    [lessonId, authUser.id],
+  )
+  const lesson = result.rows[0] ?? null
+
+  if (!lesson) {
+    return {
+      lesson: null,
+      error: { statusCode: 404, payload: { message: 'Lesson not found' } },
+    }
+  }
+
+  const canUseAi =
+    authUser.role === 'admin' ||
+    lesson.teacherId === authUser.id ||
+    (authUser.role === 'student' && lesson.enrolledStudentId === authUser.id)
+
+  if (!canUseAi) {
+    return {
+      lesson: null,
+      error: { statusCode: 403, payload: { message: 'Forbidden' } },
+    }
+  }
+
+  return { lesson, error: null }
+}
+
+const isMuxVideoUrl = (value) => {
+  try {
+    const hostname = new URL(String(value)).hostname.toLowerCase()
+    return hostname === 'player.mux.com' || hostname === 'stream.mux.com'
+  } catch {
+    return false
+  }
+}
+
+const getMuxPlaybackId = (value) => {
+  try {
+    const url = new URL(String(value))
+    const hostname = url.hostname.toLowerCase()
+
+    if (hostname === 'player.mux.com') {
+      return url.pathname.split('/').filter(Boolean)[0] ?? null
+    }
+
+    if (hostname === 'stream.mux.com') {
+      return (url.pathname.split('/').filter(Boolean)[0] ?? '').replace(/\.(m3u8|mp4)$/i, '') || null
+    }
+  } catch {
+    return null
+  }
+
+  return null
+}
+
+const downloadMuxPlaybackForGemini = async (videoUrl) => {
+  const playbackId = getMuxPlaybackId(videoUrl)
+  if (!playbackId) return null
+
+  const encodedPlaybackId = encodeURIComponent(playbackId)
+  const candidates = [
+    {
+      url: `https://stream.mux.com/${encodedPlaybackId}/audio.m4a`,
+      extension: '.m4a',
+      maxBytes: muxAudioDownloadMaxBytes,
+    },
+    {
+      url: `https://stream.mux.com/${encodedPlaybackId}/low.mp4`,
+      extension: '.mp4',
+      maxBytes: maxAutoTranscribeVideoBytes,
+    },
+  ]
+
+  const maxAttempts = Math.max(1, Math.ceil(muxAudioWaitSeconds / 10))
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    for (const candidate of candidates) {
+      try {
+        return await downloadRemoteFileStreamWithLimit(candidate.url, {
+          extension: candidate.extension,
+          maxBytes: candidate.maxBytes,
+        })
+      } catch {
+        // Try the next available Mux static rendition.
+      }
+    }
+
+    if (attempt < maxAttempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10000))
+    }
+  }
+
+  return null
+}
+
+const transcribeLessonVideo = async (request, lessonId) => {
+  if (aiProvider !== 'gemini') {
+    return { statusCode: 400, payload: { message: 'AI transcription requires AI_PROVIDER=gemini' } }
+  }
+
+  const { lesson, error } = await getAiAccessibleLesson(request, lessonId)
+  if (error) return error
+
+  const videoUrl = String(lesson.videoUrl ?? '').trim()
+  if (!videoUrl) {
+    return { statusCode: 400, payload: { message: 'Lesson video is required before transcription' } }
+  }
+
+  let absolutePath = getLocalUploadPath(videoUrl)
+  let shouldDeleteTempFile = false
+
+  try {
+    if (!absolutePath && isMuxVideoUrl(videoUrl)) {
+      absolutePath = await downloadMuxPlaybackForGemini(videoUrl)
+      shouldDeleteTempFile = Boolean(absolutePath)
+    }
+
+    if (!absolutePath) {
+      return {
+        statusCode: 400,
+        payload: {
+          message:
+            'AI ถอดสคริปต์ต้องมีไฟล์วิดีโอหรือเสียงที่ backend ดาวน์โหลดมาให้ Gemini อ่านได้ ตอนนี้ลิงก์วิดีโอนี้ไม่มีไฟล์ MP4 ที่ดาวน์โหลดได้โดยตรง กรุณาอัปโหลดไฟล์ต้นฉบับ หรือใช้วิดีโอที่มีไฟล์ MP4 playback ให้ AI อ่าน',
+        },
+      }
+    }
+
+    const transcript = await transcribeMediaWithGemini(absolutePath)
+    await saveLessonTranscript(lessonId, transcript, 'gemini')
+
+    return { statusCode: 200, payload: { data: { lessonId, transcript, source: 'gemini' } } }
+  } catch (error) {
+    console.error(`Failed to transcribe lesson ${lessonId}`, error)
+    return {
+      statusCode: 500,
+      payload: { message: error instanceof Error ? error.message : 'Failed to transcribe lesson video' },
+    }
+  } finally {
+    if (shouldDeleteTempFile && absolutePath) {
+      await unlink(absolutePath).catch(() => {})
+    }
+  }
+}
+
 const summarizeLesson = async (lessonId) => {
   await ensureAiSchema()
   const lesson = await getLessonContent(lessonId)
@@ -1456,26 +2319,39 @@ const summarizeLesson = async (lessonId) => {
   const hasTimestamp = /\[(?:\d{1,2}:)?\d{1,2}:\d{2}\]/.test(String(lesson.content ?? ''))
   const timestampRule = hasTimestamp
     ? '- ใช้ timestamp จาก transcript เท่านั้น ห้ามเดาเวลาใหม่'
-    : '- transcript นี้ยังไม่มี timestamp ให้เขียนประโยคนี้ก่อน timeline: "ยังไม่มี timestamp ใน transcript จึงระบุนาทีแบบแม่นยำไม่ได้" แล้วแบ่งเป็น "ช่วงที่ 1", "ช่วงที่ 2" ตามลำดับเนื้อหาแทน'
+    : '- transcript นี้ยังไม่มี timestamp ให้เขียนประโยคนี้ก่อน timeline: "ยังไม่มี timestamp ใน transcript จึงระบุนาทีแบบแม่นยำไม่ได้" ถ้ามี transcript ยาวพอ ให้แบ่งเป็น "ช่วงที่ 1", "ช่วงที่ 2" ตามลำดับเนื้อหาแทน'
 
   const prompt = `
-คุณคือผู้ช่วยสอนออนไลน์ภาษาไทย
-สรุปบทเรียนนี้จาก transcript/summary ที่ให้มา โดยต้องช่วยผู้เรียนรู้ว่าแต่ละช่วงเวลาพูดอะไร
+คุณคือผู้ช่วย AI ภาษาไทย
+สรุปบทเรียนนี้จาก transcript/summary ที่ให้มา โดยต้องช่วยผู้เรียนรู้ว่าแต่ละช่วงเวลาพูดอะไรแบบรายนาที
 
 รูปแบบคำตอบที่ต้องการ:
 1. ภาพรวมบทเรียน 1 ย่อหน้า
-2. Timeline คำพูดสำคัญ
-   - ถ้ามี timestamp ให้ใช้รูปแบบ: [MM:SS] "คำพูดสั้น ๆ จาก transcript" — อธิบายความหมาย/ประเด็น
-   - เลือก 5-8 ช่วงที่สำคัญที่สุด
-   - ข้อความในเครื่องหมายคำพูดต้องยกจาก transcript สั้น ๆ ห้ามแต่งคำพูดใหม่
+2. Timeline รายช่วงนาที
+   - ถ้ามี timestamp ให้จัดกลุ่มเป็นช่วงเวลา เช่น [00:00-00:59], [01:00-01:59], [02:00-02:59]
+   - สรุปให้ครอบคลุมทุกช่วงนาทีที่มีเนื้อหาสำคัญ ไม่จำกัดแค่ 5-8 ช่วง
+   - ถ้าช่วงใดมี timestamp หลายจุด ให้รวมเป็นหนึ่งช่วงนาทีและสรุปใจความ 1-3 ประโยค
+   - ยกคำพูดสั้น ๆ จาก transcript ได้เมื่อช่วยให้เข้าใจ แต่ต้องไม่แต่งคำพูดใหม่
+   - ถ้าไม่ได้ยกคำพูดตรงจาก transcript ให้บอกว่าเป็นการสรุป ไม่ใช่คำพูดตรงในวิดีโอ
+   - ถ้าบทเรียนยาวมาก ให้สรุปอย่างน้อย 12 ช่วง และไม่เกิน 40 ช่วง โดยยังเรียงตามเวลา
 3. ประเด็นที่ควรจำ 3-5 ข้อ
+4. วิเคราะห์เพิ่มเติมจาก AI
+   - แยกจากเนื้อหาในบทเรียนอย่างชัดเจน
+   - อธิบายว่าผู้เรียนควรเข้าใจต่อยอดอย่างไร
+   - ยกตัวอย่างการใช้งานจริง 2-3 ตัวอย่าง
+   - ระบุข้อควรระวังหรือข้อผิดพลาดที่พบบ่อย
+   - แนะนำสิ่งที่ควรเรียนต่อหรือฝึกต่อ
 
 กติกา:
 ${timestampRule}
-- ถ้าข้อมูลไม่พอ ให้บอกตรง ๆ ว่าข้อมูลในบทเรียนยังไม่พอ
-- ตอบเป็นภาษาไทย กระชับ อ่านง่าย
+- ถ้าข้อมูลเป็นเพียง summary สั้น ๆ และไม่มี transcript ให้บอกตรง ๆ ว่ายังสรุปรายช่วงนาทีไม่ได้เพราะไม่มี transcript
+- ส่วน "ภาพรวม", "Timeline", และ "ประเด็นที่ควรจำ" ต้องยึดจาก transcript/summary เป็นหลัก
+- ส่วน "วิเคราะห์เพิ่มเติมจาก AI" สามารถใช้ความรู้ทั่วไปเพื่ออธิบายต่อยอดได้ แต่ต้องไม่เขียนให้เหมือนเป็นคำพูดในวิดีโอ
+- ห้ามใช้คำว่า "ครู" แทนตัว AI หรือทำให้เข้าใจว่าเป็นคำพูดของผู้สอน ถ้าเป็นคำแนะนำของ AI ให้ใช้ "ฉันแนะนำว่า..."
+- ตอบเป็นภาษาไทย อ่านง่าย แต่ให้ละเอียดพอสำหรับใช้ทบทวนวิดีโอ
 
 ชื่อบทเรียน: ${lesson.title}
+ความยาวบทเรียน: ${lesson.duration ?? '-'}
 เนื้อหา:
 ${lesson.content}
 `
@@ -1496,18 +2372,75 @@ const askLessonAi = async (request, lessonId) => {
   const lesson = await getLessonContent(lessonId)
   if (!lesson) return { statusCode: 404, payload: { message: 'Lesson not found' } }
 
-  const prompt = `
-ตอบคำถามจากเนื้อหาบทเรียนนี้เท่านั้น ห้ามเดาความรู้จากนอกบทเรียน
+  const lessonRelated = isLessonRelatedQuestion(question, lesson.title)
+  const prompt = lessonRelated
+    ? `
+คำสั่งสำคัญสำหรับสไตล์คำตอบ:
+- แทนตัวเองว่า "ฉัน" เท่านั้น ไม่ใช้คำว่า "ครู" เรียกตัวเอง
+- ตอบเป็นธรรมชาติ อธิบายง่าย ๆ เหมือนคุยกับคนที่เพิ่งเริ่มเรียน
+- อธิบายให้ผู้เรียนเข้าใจเหตุผลหรือความหมาย ไม่ใช่ตอบแค่สรุปสั้น ๆ
+- ยกตัวอย่างเมื่อช่วยให้เข้าใจคำตอบได้ชัดขึ้น
+- ตอบแบบละเอียดเป็นค่าเริ่มต้น ชัดเจน ถูกต้อง และครบประเด็นพอให้ผู้เรียนเข้าใจจริง
+- ถ้าคำถามซับซ้อน ให้แบ่งเป็นหัวข้อ bullet หรือลำดับขั้นตอน
+- ให้ตอบยาวและอธิบายเต็มที่ได้ โดยจัดย่อหน้าให้อ่านง่าย ไม่อัดเป็นก้อนเดียว
+
+คุณคือผู้ช่วย AI ภาษาไทยที่คุยกับผู้เรียนอย่างเป็นกันเอง
+ตอบคำถามได้ทั่วไป ไม่จำกัดเฉพาะเนื้อหาในบทเรียน
+ถ้าคำถามเกี่ยวกับบทเรียน ให้ใช้ transcript/summary เป็นแหล่งข้อมูลหลักก่อน แล้วเสริมได้เมื่อช่วยให้เข้าใจ
+ถ้าคำถามไม่เกี่ยวกับบทเรียน ให้ตอบจากความรู้ทั่วไปอย่างตรงไปตรงมา และห้ามโยงกลับไปหาเนื้อหาบทเรียน
+
+น้ำเสียง:
+- พูดเหมือนผู้ช่วยที่เข้าใจบทเรียน เป็นกันเอง สุภาพ และใจเย็น
+- อธิบายให้เข้าใจง่าย ไม่ใช้ศัพท์ยากเกินจำเป็น
+- ถ้ามีศัพท์เทคนิค ให้แปลเป็นภาษาง่าย ๆ ก่อน แล้วค่อยยกตัวอย่าง
+- ถ้าคำตอบมีหลายขั้น ให้ไล่อธิบายทีละขั้น เพื่อให้ตามทัน
+- ตอบตรงคำถามก่อน แล้วค่อยอธิบายเหตุผล วิธีคิด ตัวอย่าง ข้อควรระวัง และภาพรวมที่เกี่ยวข้อง
+- ไม่ต้องอธิบายทั้งหมดของบทเรียน ให้ตอบเฉพาะสิ่งที่ผู้เรียนถาม
+- ใช้คำพูดธรรมชาติ เช่น "ให้เข้าใจง่าย ๆ คือ...", "ตรงนี้หมายถึง...", "ฉันขอเสริมนิดเดียว..."
+- ห้ามพูดเหมือนระบบ AI เช่น "ในฐานะ AI", "โมเดล", "ข้อมูลที่ให้มา", "จาก prompt"
+
+รูปแบบคำตอบ:
+- ไม่จำเป็นต้องใส่หัวข้อทุกครั้ง ให้ตอบเหมือนบทสนทนากับผู้ช่วย
+- ถ้าคำถามง่าย ให้ยังอธิบายที่มา เหตุผล และตัวอย่างสั้น ๆ เพื่อให้เข้าใจ ไม่ตอบแค่คำตอบสุดท้าย
+- ถ้าคำถามซับซ้อน ให้ใช้ bullet ขั้นตอน หรือหัวข้อย่อยเพื่อให้อ่านง่าย
+- ถ้ายกตัวอย่าง ให้ขึ้นต้นว่า "เช่น" และเลือกตัวอย่างที่เข้าใจง่าย
+- ถ้าเป็นเรื่องเรียน ให้จัดคำตอบแบบนี้เมื่อเหมาะสม: อธิบายหลักการ, วิธีคิดทีละขั้น, ตัวอย่าง, ข้อควรจำ, และ "สรุปง่าย ๆ" ท้ายคำตอบ
+- ถ้าต้องแยกความรู้จากบทเรียนกับความรู้ทั่วไป ให้เขียนให้ชัด เช่น "ฉันสรุปจากบทเรียนว่า..." แล้ว "ฉันเสริมว่า..."
+- ไม่ต้องปิดท้ายด้วยคำถาม เว้นแต่ผู้เรียนขอให้ช่วยฝึก
 
 กติกา:
-- ถ้ามี timestamp ใน transcript และคำตอบเกี่ยวกับช่วงใด ให้ระบุ timestamp ที่เกี่ยวข้อง เช่น [03:15]
-- ถ้าต้องอ้างคำพูด ให้ยกคำพูดสั้น ๆ จาก transcript และอธิบายต่อด้วยภาษาของคุณ
-- ถ้าไม่มีข้อมูลในบทเรียน ให้ตอบว่า "ในบทเรียนนี้ยังไม่มีข้อมูลส่วนนั้น"
-- ตอบเป็นภาษาไทย กระชับ และชัดเจน
+- ให้ตัดสินก่อนว่าคำถามเป็น "คำถามเกี่ยวกับบทเรียน" หรือ "คำถามทั่วไป"
+- ถ้าเป็นคำถามทั่วไป เช่น กินอะไรดี, ช่วยคิดหน่อย, วางแผนชีวิต, แต่งเรื่อง, เขียนโค้ด, ข่าว, สุขภาพทั่วไป, การเงินทั่วไป, หรือเรื่องอื่นที่ไม่เกี่ยวกับบทเรียน ให้ตอบคำถามนั้นทันทีจากความรู้ทั่วไป
+- สำหรับคำถามทั่วไป ห้ามตอบว่า "ในบทเรียนนี้ยังไม่มีข้อมูล", ห้ามถามกลับให้ผู้เรียนถามเรื่องบทเรียน, และห้ามฝืนโยงกลับเข้า transcript/summary
+- ถ้าคำถามเกี่ยวกับบทเรียน ให้ยึดเนื้อหาบทเรียนเป็นหลักก่อน แล้วค่อยเสริมด้วยความรู้ทั่วไปเมื่อช่วยให้เข้าใจ
+- ถ้าคำถามทั่วไปที่ไม่เกี่ยวกับบทเรียน ให้ตอบได้ตามปกติ ไม่ต้องฝืนโยงเข้าบทเรียน
+- ห้ามใช้คำว่า "ครู" แทนตัว AI ในคำตอบ ให้ใช้ "ฉัน" เท่านั้น
+- ถ้าต้องอ้างคำพูดจากบทเรียน ให้ยกคำพูดสั้น ๆ จาก transcript ในเครื่องหมายคำพูด แล้วอธิบายต่อด้วยภาษาของคุณ
+- ถ้าไม่ได้ยกคำพูดตรงในเครื่องหมายคำพูด ให้บอกให้ชัดว่าเป็นการสรุปจากบทเรียน ไม่ใช่คำพูดตรงในคลิป
+- ถ้าผู้เรียนถามเรื่องในบทเรียนโดยตรง แต่บทเรียนไม่มีข้อมูลส่วนนั้น ให้บอกว่า "ฉันไม่เห็นข้อมูลส่วนนี้ในบทเรียน" แล้วค่อยอธิบายด้วยความรู้ทั่วไปอย่างระมัดระวัง
+- ห้ามแต่ง timestamp หรือแต่งคำพูดว่าอยู่ในวิดีโอถ้า transcript ไม่ได้ระบุไว้
+- ให้ความยาวคำตอบมากพอสำหรับความเข้าใจ เน้นอธิบายละเอียด ชัดเจน และถูกต้องมากกว่าสั้น
+- ถ้าคำถามต้องการคำอธิบาย ให้ขยายความอย่างละเอียด ไม่ตอบห้วนหรือข้ามขั้นตอนสำคัญ
+- ห้ามสรุปทั้งบทเรียนถ้าผู้เรียนถามแค่จุดเดียว
+- เขียนคำตอบยาวได้ แต่ต้องเป็นระเบียบ อ่านง่าย และเกี่ยวข้องกับคำถามโดยตรง
 
 ชื่อบทเรียน: ${lesson.title}
 เนื้อหา:
 ${lesson.content}
+
+คำถาม: ${question}
+`
+    : `
+คุณคือผู้ช่วย AI ภาษาไทยที่คุยกับผู้ใช้แบบเป็นกันเอง
+
+กติกาสำคัญ:
+- คำถามนี้เป็นคำถามทั่วไป ไม่เกี่ยวกับบทเรียน
+- ห้ามพูดถึงบทเรียน คอร์ส คลิป วิดีโอ transcript หรือเนื้อหาที่เรียน
+- ห้ามตอบว่า "ในบทเรียนนี้ยังไม่มีข้อมูล"
+- ห้ามใช้คำว่า "ครู" แทนตัวเอง ให้แทนตัวเองว่า "ฉัน" เท่านั้น
+- ตอบคำถามจากความรู้ทั่วไปอย่างตรงไปตรงมา เป็นธรรมชาติ และช่วยคิดให้ผู้ใช้จริง ๆ
+- ถ้าคำถามสั้นหรือกำกวม ให้เดาบริบทแบบสมเหตุสมผลก่อน แล้วตอบให้ใช้งานได้ทันที
+- ถ้าเกี่ยวกับเรื่องที่เปลี่ยนตามเวลา เช่น ข่าว ราคา หุ้น สภาพอากาศ หรือข้อมูลล่าสุด ให้บอกว่าควรตรวจข้อมูลล่าสุดประกอบ
 
 คำถาม: ${question}
 `
@@ -1554,8 +2487,17 @@ ${lesson.content}
 
   await query('DELETE FROM quiz_questions WHERE lesson_id = $1', [lessonId])
 
+  const savedQuestions = []
+
   for (const [questionIndex, question] of questions.entries()) {
     const questionId = `q-ai-${crypto.randomUUID()}`
+    const savedQuestion = {
+      id: questionId,
+      question: String(question.question ?? ''),
+      explanation: String(question.explanation ?? ''),
+      options: [],
+    }
+
     await query(
       `
         INSERT INTO quiz_questions (id, lesson_id, question, explanation, sort_order)
@@ -1564,32 +2506,42 @@ ${lesson.content}
       [
         questionId,
         lessonId,
-        String(question.question ?? ''),
-        String(question.explanation ?? ''),
+        savedQuestion.question,
+        savedQuestion.explanation,
         questionIndex + 1,
       ],
     )
 
     for (const [optionIndex, option] of (question.options ?? []).entries()) {
+      const optionId = `qo-ai-${crypto.randomUUID()}`
+      const savedOption = {
+        id: optionId,
+        text: String(option.text ?? ''),
+        isCorrect: Boolean(option.isCorrect),
+      }
+
       await query(
         `
           INSERT INTO quiz_options (id, question_id, text, is_correct, sort_order)
           VALUES ($1, $2, $3, $4, $5)
         `,
         [
-          `qo-ai-${crypto.randomUUID()}`,
+          optionId,
           questionId,
-          String(option.text ?? ''),
-          Boolean(option.isCorrect),
+          savedOption.text,
+          savedOption.isCorrect,
           optionIndex + 1,
         ],
       )
+      savedQuestion.options.push(savedOption)
     }
+
+    savedQuestions.push(savedQuestion)
   }
 
-  await saveAiOutput({ lessonId, outputType: 'quiz', prompt, result: { questions } })
+  await saveAiOutput({ lessonId, outputType: 'quiz', prompt, result: { questions: savedQuestions } })
 
-  return { statusCode: 200, payload: { data: { questions } } }
+  return { statusCode: 200, payload: { data: { questions: savedQuestions } } }
 }
 
 const getBearerToken = (request) => {
@@ -1859,6 +2811,10 @@ const getCourseBySlug = async (slug) => {
         l.preview,
         l.video_url,
         l.summary,
+        l.ai_status,
+        l.ai_error,
+        ai.ai_summary,
+        (lt.lesson_id IS NOT NULL) AS has_transcript,
         q.id AS question_id,
         q.question,
         q.explanation,
@@ -1866,6 +2822,14 @@ const getCourseBySlug = async (slug) => {
         o.text AS option_text,
         o.is_correct
       FROM lessons l
+      LEFT JOIN LATERAL (
+        SELECT result->>'summary' AS ai_summary
+        FROM ai_outputs ao
+        WHERE ao.lesson_id = l.id AND ao.output_type = 'summary'
+        ORDER BY ao.created_at DESC
+        LIMIT 1
+      ) ai ON TRUE
+      LEFT JOIN lesson_transcripts lt ON lt.lesson_id = l.id
       LEFT JOIN quiz_questions q ON q.lesson_id = l.id
       LEFT JOIN quiz_options o ON o.question_id = q.id
       WHERE l.course_id = $1
@@ -1885,6 +2849,10 @@ const getCourseBySlug = async (slug) => {
         preview: row.preview,
         videoUrl: row.video_url ?? undefined,
         summary: row.summary,
+        aiStatus: row.ai_status ?? 'idle',
+        aiError: row.ai_error ?? null,
+        aiSummary: row.ai_summary ?? null,
+        hasTranscript: Boolean(row.has_transcript),
         quizQuestions: [],
       })
     }
@@ -1919,10 +2887,72 @@ const getCourseBySlug = async (slug) => {
   }
 }
 
+const getTeacherDashboardCourses = async (teacherId) => {
+  const result = await query(
+    `
+      SELECT
+        c.*,
+        COUNT(l.id) OVER (PARTITION BY c.id)::int AS lesson_count,
+        u.id AS instructor_id,
+        u.name AS instructor_name,
+        u.title AS instructor_title,
+        u.bio AS instructor_bio,
+        u.avatar_url AS instructor_avatar_url,
+        u.rating AS instructor_rating,
+        u.total_students AS instructor_total_students,
+        l.id AS lesson_id,
+        l.title AS lesson_title,
+        l.duration AS lesson_duration,
+        l.preview AS lesson_preview,
+        l.video_url AS lesson_video_url,
+        l.summary AS lesson_summary,
+        l.ai_status AS lesson_ai_status,
+        l.ai_error AS lesson_ai_error,
+        (lt.lesson_id IS NOT NULL) AS lesson_has_transcript
+      FROM courses c
+      JOIN users u ON u.id = c.teacher_id
+      LEFT JOIN lessons l ON l.course_id = c.id
+      LEFT JOIN lesson_transcripts lt ON lt.lesson_id = l.id
+      WHERE c.teacher_id = $1
+      ORDER BY c.updated_at DESC, l.sort_order
+    `,
+    [teacherId],
+  )
+
+  const courseMap = new Map()
+
+  for (const row of result.rows) {
+    if (!courseMap.has(row.id)) {
+      courseMap.set(row.id, {
+        ...toCourseSummary(row),
+        lessons: [],
+      })
+    }
+
+    if (!row.lesson_id) continue
+
+    courseMap.get(row.id).lessons.push({
+      id: row.lesson_id,
+      title: row.lesson_title,
+      duration: row.lesson_duration,
+      preview: row.lesson_preview,
+      videoUrl: row.lesson_video_url ?? undefined,
+      summary: row.lesson_summary,
+      aiStatus: row.lesson_ai_status ?? 'idle',
+      aiError: row.lesson_ai_error ?? null,
+      aiSummary: null,
+      hasTranscript: Boolean(row.lesson_has_transcript),
+      quizQuestions: [],
+    })
+  }
+
+  return Array.from(courseMap.values())
+}
+
 const getEnrollmentRecord = async (studentId, courseId) => {
   const result = await query(
     `
-      SELECT course_id, progress, completed_lessons, last_lesson_id, joined_at
+      SELECT course_id, progress, completed_lessons, last_lesson_id, last_accessed_at, joined_at
       FROM enrollments
       WHERE student_id = $1 AND course_id = $2
       LIMIT 1
@@ -1939,6 +2969,7 @@ const getEnrollmentRecord = async (studentId, courseId) => {
     progress: Number(row.progress),
     completedLessons: Number(row.completed_lessons),
     lastLessonId: row.last_lesson_id,
+    lastAccessedAt: row.last_accessed_at,
     joinedAt: row.joined_at,
   }
 }
@@ -2011,12 +3042,13 @@ const getStudentDashboard = async (studentId) => {
         e.progress,
         e.completed_lessons,
         e.last_lesson_id,
+        e.last_accessed_at,
         e.joined_at,
         c.slug
       FROM enrollments e
       JOIN courses c ON c.id = e.course_id
       WHERE e.student_id = $1
-      ORDER BY e.joined_at DESC
+      ORDER BY COALESCE(e.last_accessed_at, e.joined_at::timestamptz) DESC
     `,
     [studentId],
   )
@@ -2032,6 +3064,7 @@ const getStudentDashboard = async (studentId) => {
         progress: Number(enrollment.progress),
         completedLessons: Number(enrollment.completed_lessons),
         lastLessonId: enrollment.last_lesson_id,
+        lastAccessedAt: enrollment.last_accessed_at,
         joinedAt: enrollment.joined_at,
       },
     })
@@ -2190,15 +3223,10 @@ const getTeacherDashboard = async (teacherId) => {
 
   if (!user) return null
 
-  const courseSummaries = await getCourses({ teacherId, includeUnpublished: true })
-  const courses = (
-    await Promise.all(courseSummaries.map((course) => getCourseBySlug(course.slug)))
-  ).filter(Boolean)
-
   return {
     user: toUser(user),
     profile: await getUserProfile(teacherId),
-    courses,
+    courses: await getTeacherDashboardCourses(teacherId),
   }
 }
 
@@ -2215,7 +3243,7 @@ const getAdminDashboard = async () => {
       GROUP BY u.id
       ORDER BY u.created_at DESC
     `),
-    getCourses(),
+    getCourses({ includeUnpublished: true }),
     query(`
       SELECT
         COUNT(*)::int AS total_users,
@@ -2305,8 +3333,8 @@ const createCourse = async (request) => {
     const lessonId = `lesson-${crypto.randomUUID()}`
     await query(
       `
-        INSERT INTO lessons (id, course_id, title, duration, preview, video_url, summary, sort_order)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 1)
+        INSERT INTO lessons (id, course_id, title, duration, preview, video_url, summary, ai_status, ai_error, sort_order)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, 1)
       `,
       [
         lessonId,
@@ -2316,6 +3344,7 @@ const createCourse = async (request) => {
         Boolean(body.lessonPreview ?? true),
         body.videoUrl ? String(body.videoUrl) : null,
         String(body.lessonSummary ?? 'บทเรียนแรกของคอร์สนี้'),
+        body.videoUrl ? 'pending' : 'idle',
       ],
     )
 
@@ -2416,7 +3445,14 @@ const saveCourseLesson = async (request, slug, lessonId) => {
     await query(
       `
         UPDATE lessons
-        SET title = $1, duration = $2, preview = $3, video_url = $4, summary = $5
+        SET
+          title = $1,
+          duration = $2,
+          preview = $3,
+          video_url = $4,
+          summary = $5,
+          ai_status = CASE WHEN $4::text IS NULL OR $4::text = '' THEN 'idle' ELSE 'pending' END,
+          ai_error = NULL
         WHERE id = $6
       `,
       [title, duration, preview, videoUrl || null, summary, lessonId],
@@ -2432,8 +3468,8 @@ const saveCourseLesson = async (request, slug, lessonId) => {
 
     await query(
       `
-        INSERT INTO lessons (id, course_id, title, duration, preview, video_url, summary, sort_order)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        INSERT INTO lessons (id, course_id, title, duration, preview, video_url, summary, ai_status, ai_error, sort_order)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9)
       `,
       [
         nextLessonId,
@@ -2443,6 +3479,7 @@ const saveCourseLesson = async (request, slug, lessonId) => {
         preview,
         videoUrl || null,
         summary,
+        videoUrl ? 'pending' : 'idle',
         Number(sortResult.rows[0].next_sort_order),
       ],
     )
@@ -2466,6 +3503,10 @@ const updateCourseStatus = async (request, slug) => {
 
   if (!['draft', 'published', 'hidden'].includes(status)) {
     return { statusCode: 400, payload: { message: 'สถานะคอร์สไม่ถูกต้อง' } }
+  }
+
+  if (status === 'published' && authUser.role !== 'admin') {
+    return { statusCode: 403, payload: { message: 'คอร์สฉบับร่างต้องรอแอดมินตรวจสอบและอนุมัติก่อนเผยแพร่' } }
   }
 
   await query('UPDATE courses SET status = $1, updated_at = CURRENT_DATE WHERE id = $2', [
@@ -2613,6 +3654,52 @@ const enrollInCourse = async (request, slug) => {
   }
 }
 
+const rememberCurrentCourseLesson = async (request, slug, lessonId) => {
+  const authUser = await getAuthUser(request)
+
+  if (!authUser) {
+    return { statusCode: 401, payload: { message: 'Unauthorized' } }
+  }
+
+  if (authUser.role !== 'student') {
+    return { statusCode: 403, payload: { message: 'Forbidden' } }
+  }
+
+  const course = await getCourseBySlug(slug)
+
+  if (!course || course.status !== 'published') {
+    return { statusCode: 404, payload: { message: 'Course not found' } }
+  }
+
+  const lessonExists = course.lessons.some((lesson) => lesson.id === lessonId)
+
+  if (!lessonExists) {
+    return { statusCode: 404, payload: { message: 'Lesson not found' } }
+  }
+
+  const enrollment = await getEnrollmentRecord(authUser.id, course.id)
+
+  if (!enrollment) {
+    return { statusCode: 403, payload: { message: 'Please enroll before saving lesson progress' } }
+  }
+
+  await query(
+    `
+      UPDATE enrollments
+      SET last_lesson_id = $1, last_accessed_at = NOW()
+      WHERE student_id = $2 AND course_id = $3
+    `,
+    [lessonId, authUser.id, course.id],
+  )
+
+  return {
+    statusCode: 200,
+    payload: {
+      data: await getEnrollmentRecord(authUser.id, course.id),
+    },
+  }
+}
+
 const completeCourseLesson = async (request, slug, lessonId) => {
   const authUser = await getAuthUser(request)
 
@@ -2648,7 +3735,7 @@ const completeCourseLesson = async (request, slug, lessonId) => {
   await query(
     `
       UPDATE enrollments
-      SET progress = $1, completed_lessons = $2, last_lesson_id = $3
+      SET progress = $1, completed_lessons = $2, last_lesson_id = $3, last_accessed_at = NOW()
       WHERE student_id = $4 AND course_id = $5
     `,
     [progress, completedLessons, lessonId, authUser.id, course.id],
@@ -2669,7 +3756,7 @@ const routeRequest = async (request, response) => {
     response.writeHead(204, {
       'Access-Control-Allow-Origin': frontendOrigin,
       'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+      'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-File-Name',
     })
     response.end()
     return
@@ -2740,6 +3827,12 @@ const routeRequest = async (request, response) => {
       return
     }
 
+    if (request.method === 'POST' && action === 'transcribe') {
+      const result = await transcribeLessonVideo(request, lessonId)
+      sendJson(response, result.statusCode, result.payload)
+      return
+    }
+
     if (request.method === 'POST' && action === 'summarize') {
       const result = await summarizeLesson(lessonId)
       sendJson(response, result.statusCode, result.payload)
@@ -2773,6 +3866,31 @@ const routeRequest = async (request, response) => {
 
   if (url.pathname === '/api/uploads' && request.method === 'POST') {
     const result = await saveUploadAsset(request)
+    sendJson(response, result.statusCode, result.payload)
+    return
+  }
+
+  if (url.pathname === '/api/uploads/video' && request.method === 'POST') {
+    const result = await saveVideoUploadStream(request)
+    sendJson(response, result.statusCode, result.payload)
+    return
+  }
+
+  if (url.pathname === '/api/uploads/video/inspect' && request.method === 'GET') {
+    const result = await inspectUploadedVideo(request, url)
+    sendJson(response, result.statusCode, result.payload)
+    return
+  }
+
+  if (url.pathname === '/api/uploads/mux/direct-upload' && request.method === 'POST') {
+    const result = await createMuxDirectUpload(request)
+    sendJson(response, result.statusCode, result.payload)
+    return
+  }
+
+  if (url.pathname.startsWith('/api/uploads/mux/direct-upload/') && request.method === 'GET') {
+    const uploadId = decodeURIComponent(url.pathname.replace('/api/uploads/mux/direct-upload/', ''))
+    const result = await getMuxDirectUploadStatus(request, uploadId)
     sendJson(response, result.statusCode, result.payload)
     return
   }
@@ -2838,6 +3956,8 @@ const routeRequest = async (request, response) => {
     const result =
       action === 'complete'
         ? await completeCourseLesson(request, slug, lessonId)
+        : action === 'current'
+          ? await rememberCurrentCourseLesson(request, slug, lessonId)
         : action === 'delete'
           ? await deleteCourseLesson(request, slug, lessonId)
           : await saveCourseLesson(request, slug, lessonId || null)
@@ -2952,7 +4072,7 @@ ensureAuthSchema()
   .then(ensureSeedCredentials)
   .then(ensureCourseSchema)
   .then(ensureAiSchema)
-  .then(normalizeExistingUploadedVideos)
+  .then(() => (normalizeExistingUploads ? normalizeExistingUploadedVideos() : undefined))
   .then(() => {
     server.listen(port, '0.0.0.0', () => {
       console.log(`Backend API listening on port ${port}`)

@@ -20,8 +20,8 @@ export default function QuizCard({ questions }: QuizCardProps) {
     <div className="rounded-lg border border-slate-200 bg-white">
       <div className="flex flex-col gap-2 border-b border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h2 className="text-base font-semibold text-slate-950">AI Quiz</h2>
-          <p className="mt-1 text-sm text-slate-500">แบบทดสอบจากเนื้อหาในวิดีโอ</p>
+          <h2 className="text-base font-semibold text-slate-950">แบบทดสอบจาก AI</h2>
+          <p className="mt-1 text-sm text-slate-500">ทบทวนจากบทเรียนนี้</p>
         </div>
         <span className="w-fit rounded-md bg-slate-100 px-3 py-1 text-sm font-medium text-slate-700">
           {correctCount}/{questions.length} ถูก

@@ -1,30 +1,28 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
-import { BookOpen, ChevronDown, Fingerprint, LogOut, Menu, Moon, ShoppingCart, Sun, UserRound, X } from 'lucide-react'
+import { BookOpen, LogOut, Menu, Moon, ShoppingCart, Sun, UserRound, X } from 'lucide-react'
 import { api, authStorage, cartStorage, type AuthSession } from '../services/api'
 
 const publicNavItems = [
-  { to: '/', label: 'หน้าแรก' },
-  { to: '/courses', label: 'คอร์ส' },
+  { to: '/', label: 'หน้าหลัก' },
+  { to: '/contact', label: 'ติดต่อ' },
 ]
 
-const courseNavItem = publicNavItems[1]
-const aboutNavItem = { to: '/#about', label: 'เกี่ยวกับ' }
-const contactNavItem = { to: '/contact', label: 'ติดต่อเรา' }
+const courseNavItem = { to: '/courses', label: 'คอร์ส' }
 
 const navItemClass = (isActive: boolean) =>
   [
-    'rounded-md px-3 py-2 text-sm font-medium transition',
+    'rounded-md px-3 py-2 text-sm font-semibold transition',
     isActive
-      ? 'bg-slate-950 text-white dark:bg-white dark:text-slate-950'
-      : 'text-slate-600 hover:bg-slate-100 hover:text-slate-950 dark:text-slate-300 dark:hover:bg-white/10 dark:hover:text-white',
+      ? 'text-slate-950 underline decoration-slate-950 decoration-2 underline-offset-[10px] dark:text-white dark:decoration-white'
+      : 'text-slate-600 hover:text-slate-950 dark:text-slate-300 dark:hover:text-white',
   ].join(' ')
 
 const logoutButtonClass =
   'inline-flex items-center justify-center gap-2 rounded-md bg-rose-700 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-rose-800 focus:outline-none focus:ring-2 focus:ring-rose-700 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60'
 
 type ThemeMode = 'light' | 'dark'
-const themeStorageKey = 'learnos_theme'
+const themeStorageKey = 'mycourse_theme'
 
 const getInitialTheme = (): ThemeMode => {
   const savedTheme = localStorage.getItem(themeStorageKey)
@@ -62,8 +60,6 @@ export default function Navbar() {
   const [cartCount, setCartCount] = useState(() => cartStorage.getItems().length)
   const [theme, setTheme] = useState<ThemeMode>(() => getInitialTheme())
   const currentPath = `${location.pathname}${location.search}`
-  const currentLocation = `${location.pathname}${location.search}${location.hash}`
-  const publicAboutActive = location.pathname === '/contact' || location.hash === '#about'
   const isNavItemActive = (to: string) => {
     if (to === '/') return location.pathname === '/' && !location.hash
     return currentPath === to
@@ -136,13 +132,13 @@ export default function Navbar() {
   const ThemeIcon = theme === 'dark' ? Sun : Moon
 
   return (
-    <header className="sticky top-0 z-40 border-b border-slate-200/80 bg-white/90 shadow-sm shadow-slate-200/60 backdrop-blur">
-      <div className="container-page flex h-16 items-center justify-between">
+    <header className="sticky top-0 z-40 border-b border-zinc-200/80 bg-white/95 backdrop-blur">
+      <div className="container-page flex h-20 items-center justify-between">
         <Link to="/" className="flex items-center gap-2 text-slate-950">
-          <span className="inline-flex h-9 w-9 items-center justify-center rounded-md bg-slate-950 text-white shadow-sm shadow-slate-950/15 dark:bg-white dark:text-slate-950 dark:shadow-white/10">
-            <BookOpen size={19} />
+          <span className="inline-flex h-9 w-9 items-center justify-center rounded-[6px] bg-black text-white">
+            <BookOpen size={22} className="fill-white" />
           </span>
-          <span className="text-lg font-semibold">LearnOS</span>
+          <span className="text-xl font-extrabold tracking-tight">LearnPro</span>
         </Link>
 
         <nav className="hidden items-center gap-1 md:flex">
@@ -151,42 +147,20 @@ export default function Navbar() {
               {item.label}
             </Link>
           ))}
-          {!session ? (
-            <div className="group relative">
-              <Link
-                to={aboutNavItem.to}
-                className={`${navItemClass(publicAboutActive)} inline-flex items-center gap-1`}
-              >
-                {aboutNavItem.label}
-                <ChevronDown size={15} className="transition group-hover:rotate-180" />
-              </Link>
-              <div className="absolute left-0 top-full hidden min-w-44 pt-2 group-hover:block group-focus-within:block">
-                <div className="rounded-lg border border-slate-200 bg-white p-1.5 shadow-xl shadow-slate-200/80 dark:border-white/10 dark:bg-slate-900 dark:shadow-black/40">
-                  <Link
-                    to={contactNavItem.to}
-                    className="block rounded-md px-3 py-2.5 text-sm transition hover:bg-slate-100 dark:hover:bg-white/10"
-                  >
-                    <span className="block font-semibold text-slate-950 dark:text-white">{contactNavItem.label}</span>
-                    <span className="mt-0.5 block text-xs leading-5 text-slate-500 dark:text-slate-400">
-                      ส่งข้อความถึงทีมงาน LearnOS
-                    </span>
-                  </Link>
-                </div>
-              </div>
-            </div>
-          ) : null}
         </nav>
 
         <div className="hidden items-center gap-2 md:flex">
-          <button
-            type="button"
-            className="group inline-flex h-10 w-10 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-800 shadow-sm shadow-slate-200/60 transition hover:border-slate-300 hover:bg-slate-100 hover:text-slate-950 dark:border-white/15 dark:bg-slate-900 dark:text-slate-100 dark:shadow-black/30 dark:hover:bg-white dark:hover:text-slate-950"
-            onClick={toggleTheme}
-            aria-label={theme === 'dark' ? 'เปลี่ยนเป็นโหมดสว่าง' : 'เปลี่ยนเป็นโหมดมืด'}
-            title={theme === 'dark' ? 'Light mode' : 'Dark mode'}
-          >
-            <ThemeIcon size={17} className="transition group-hover:scale-110" />
-          </button>
+          {session ? (
+            <button
+              type="button"
+              className="group inline-flex h-10 w-10 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-800 shadow-sm shadow-slate-200/60 transition hover:border-slate-300 hover:bg-slate-100 hover:text-slate-950 dark:border-white/15 dark:bg-slate-900 dark:text-slate-100 dark:shadow-black/30 dark:hover:bg-white dark:hover:text-slate-950"
+              onClick={toggleTheme}
+              aria-label={theme === 'dark' ? 'เปลี่ยนเป็นโหมดสว่าง' : 'เปลี่ยนเป็นโหมดมืด'}
+              title={theme === 'dark' ? 'โหมดสว่าง' : 'โหมดมืด'}
+            >
+              <ThemeIcon size={17} className="transition group-hover:scale-110" />
+            </button>
+          ) : null}
           {session ? (
             <>
               <Link
@@ -199,8 +173,7 @@ export default function Navbar() {
               </Link>
               {session.user.role === 'student' ? (
                 <Link
-                  to="/cart"
-                  state={{ from: currentLocation }}
+                  to="/courses?cart=1"
                   className="relative inline-flex h-10 w-10 items-center justify-center rounded-md border border-emerald-200 bg-emerald-50 text-emerald-700 shadow-sm shadow-emerald-100 transition hover:bg-emerald-100"
                   aria-label="ตะกร้าคอร์ส"
                 >
@@ -218,10 +191,17 @@ export default function Navbar() {
               </button>
             </>
           ) : (
-            <Link to="/login" className="btn-primary">
-              <Fingerprint size={16} />
-              เข้าสู่ระบบ
-            </Link>
+            <>
+              <Link to="/login" className="px-3 py-2 text-sm font-semibold text-black transition hover:text-zinc-600">
+                เข้าสู่ระบบ
+              </Link>
+              <Link
+                to="/register"
+                className="inline-flex h-11 items-center justify-center rounded-[8px] bg-black px-5 text-sm font-bold text-white shadow-[0_10px_20px_rgba(0,0,0,0.16)] transition hover:bg-zinc-800"
+              >
+                สมัครสมาชิก
+              </Link>
+            </>
           )}
         </div>
 
@@ -244,27 +224,13 @@ export default function Navbar() {
               onClick={toggleTheme}
             >
               <ThemeIcon size={17} />
-              {theme === 'dark' ? 'Light mode' : 'Dark mode'}
+              {theme === 'dark' ? 'โหมดสว่าง' : 'โหมดมืด'}
             </button>
             {navItems.map((item) => (
               <Link key={item.to} to={item.to} className={navItemClass(isNavItemActive(item.to))}>
                 {item.label}
               </Link>
             ))}
-            {!session ? (
-              <div className="grid gap-2 rounded-lg border border-slate-200 p-2 dark:border-white/10">
-                <Link to={aboutNavItem.to} className={navItemClass(publicAboutActive)}>
-                  {aboutNavItem.label}
-                </Link>
-                <Link
-                  to={contactNavItem.to}
-                  className="rounded-md px-3 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-950 dark:text-slate-300 dark:hover:bg-white/10 dark:hover:text-white"
-                >
-                  {contactNavItem.label}
-                </Link>
-              </div>
-            ) : null}
-
             {session ? (
               <div className="grid gap-2 pt-2">
                 <Link
@@ -277,8 +243,7 @@ export default function Navbar() {
                 </Link>
                 {session.user.role === 'student' ? (
                   <Link
-                    to="/cart"
-                    state={{ from: currentLocation }}
+                    to="/courses?cart=1"
                     className="flex items-center justify-center gap-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm font-medium text-amber-800 transition hover:bg-amber-100"
                     aria-label="ตะกร้าคอร์ส"
                   >
@@ -298,9 +263,17 @@ export default function Navbar() {
               </div>
             ) : (
               <div className="grid gap-2 pt-2">
-                <Link to="/login" className="btn-primary">
-                  <Fingerprint size={16} />
+                <Link
+                  to="/login"
+                  className="flex items-center justify-center rounded-md border border-zinc-200 bg-white p-3 text-sm font-semibold text-black transition hover:border-black"
+                >
                   เข้าสู่ระบบ
+                </Link>
+                <Link
+                  to="/register"
+                  className="flex items-center justify-center rounded-md bg-black p-3 text-sm font-bold text-white transition hover:bg-zinc-800"
+                >
+                  สมัครสมาชิก
                 </Link>
               </div>
             )}

@@ -40,6 +40,26 @@ html {
   }
 }
 
+@keyframes studentPageIn {
+  from {
+    transform: translateY(8px);
+  }
+
+  to {
+    transform: translateY(0);
+  }
+}
+
+@keyframes studentSidebarIn {
+  from {
+    transform: translateX(-10px);
+  }
+
+  to {
+    transform: translateX(0);
+  }
+}
+
 body {
   min-width: 320px;
   min-height: 100vh;
@@ -111,6 +131,34 @@ video {
 
   .table-cell {
     @apply px-4 py-3 text-left text-sm;
+  }
+
+  .student-page-shell {
+    @apply min-h-screen bg-white text-black lg:pl-[280px];
+  }
+
+  .student-page-main {
+    animation: studentPageIn 180ms ease-out both;
+    will-change: transform;
+  }
+
+  .student-section-panel {
+    animation: none;
+  }
+
+  .student-sidebar-nav {
+    animation: studentSidebarIn 220ms ease-out both;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
   }
 }
 

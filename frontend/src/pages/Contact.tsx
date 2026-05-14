@@ -7,9 +7,9 @@ const contactCards = [
   {
     icon: Mail,
     title: 'อีเมลทีมงาน',
-    value: 'support@learnos.app',
+    value: 'support@mycourse.app',
     description: 'เหมาะสำหรับคำถามเรื่องบัญชี คอร์ส และการชำระเงิน',
-    href: 'mailto:support@learnos.app',
+    href: 'mailto:support@mycourse.app',
   },
   {
     icon: Clock3,
@@ -38,21 +38,21 @@ export default function Contact() {
     <>
       <section className="relative overflow-hidden bg-slate-950 text-white">
         <img
-          src="https://images.unsplash.com/photo-1551836022-d5d88e9218df?auto=format&fit=crop&w=1800&q=80"
-          alt="Support team workspace"
-          className="absolute inset-0 h-full w-full object-cover opacity-30"
+          src="/my-course-logo.png"
+          alt="My Course support logo"
+          className="absolute inset-0 h-full w-full bg-white object-contain opacity-20"
         />
         <div className="absolute inset-0 bg-slate-950/75" />
         <div className="container-page relative grid min-h-[440px] gap-8 py-16 lg:grid-cols-[minmax(0,1fr)_380px] lg:items-center">
           <div className="max-w-3xl">
             <h1 className="text-4xl font-semibold leading-tight text-white sm:text-5xl">ติดต่อเรา</h1>
             <p className="mt-5 max-w-2xl text-base leading-7 text-slate-200 sm:text-lg">
-              ส่งคำถามถึงทีม LearnOS ได้ทั้งเรื่องการใช้งาน บัญชีผู้เรียน การจัดคอร์สของคุณครู
+              ส่งคำถามถึงทีม My Course ได้ทั้งเรื่องการใช้งาน บัญชีผู้เรียน การจัดคอร์สของคุณครู
               หรือปัญหาในหน้าเรียน เราจะช่วยไล่ให้เป็นขั้นตอน
             </p>
             <div className="mt-8 flex flex-col gap-3 sm:flex-row">
               <a
-                href="mailto:support@learnos.app"
+                href="mailto:support@mycourse.app"
                 className="inline-flex items-center justify-center gap-2 rounded-md bg-white px-4 py-2.5 text-sm font-semibold text-slate-950 shadow-sm shadow-black/20 transition hover:bg-slate-200"
               >
                 <Mail size={17} />

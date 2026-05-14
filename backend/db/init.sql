@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS lessons (
   preview BOOLEAN NOT NULL DEFAULT false,
   video_url TEXT,
   summary TEXT NOT NULL,
+  ai_status TEXT NOT NULL DEFAULT 'idle' CHECK (ai_status IN ('idle', 'pending', 'processing', 'ready', 'failed')),
+  ai_error TEXT,
   sort_order INTEGER NOT NULL DEFAULT 0
 );
 
@@ -65,6 +67,7 @@ CREATE TABLE IF NOT EXISTS enrollments (
   progress INTEGER NOT NULL DEFAULT 0 CHECK (progress >= 0 AND progress <= 100),
   completed_lessons INTEGER NOT NULL DEFAULT 0,
   last_lesson_id TEXT REFERENCES lessons(id),
+  last_accessed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   joined_at DATE NOT NULL DEFAULT CURRENT_DATE,
   UNIQUE (student_id, course_id)
 );
